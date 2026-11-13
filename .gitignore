@@ -1,0 +1,13 @@
+# 运行时状态 / 账本快照（state/ 约 383M，全是 backups/ 账本快照，绝不入库）
+state/
+# 依赖与日志
+node_modules/
+*.log
+.env
+.env.*
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+# 备份与临时产物
+*.bak-*
+tmp/

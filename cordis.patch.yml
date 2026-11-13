@@ -1,0 +1,61 @@
+# dsh-skill-evolution-backtest — packages the deterministic half of the Mnemon
+# skill-evolution pipeline as agent tools.
+#
+# WHY THIS EXISTS
+#   The Mnemon memory plugin evolves skills: a background reviewer produces
+#   `suggestions` ("this skill could learn X"), and an agent is expected to turn
+#   a suggestion into an improved SKILL.md, backtest it, and leave the result as
+#   a `ready` draft for the human to approve. The creative half — actually
+#   writing the improved SKILL.md — belongs to the agent. The DETERMINISTIC half
+#   around it (scan suggestions, per-check partial-score the draft against the
+#   current file, write the ledger atomically with a backup + concurrency guard,
+#   then independently re-read to verify) is pure plumbing that every session
+#   was re-deriving by hand. This plugin makes that plumbing callable, so an
+#   agent drives the pipeline with tools instead of re-authoring one-off
+#   python/cjs scripts each time.
+#
+# WHAT THE TOOLS DO / DO NOT DO
+#   scan       — read-only: list pending/review/expired suggestions + freshness.
+#   backtest   — read-only: per-check partial-score a candidate draft vs the
+#                current SKILL.md using an anchor grader (score = passed checks
+#                / total checks, aligned with the host runScore semantics).
+#   write      — MUTATING: build a `ready` draft + before/after runs from a
+#                graded backtest, back up both ledgers, guard against a stale
+#                baseHash / an already-adopted suggestion, then atomic-write.
+#   verify     — read-only: independently re-read what `write` landed and recheck
+#                every invariant (content match, baseHash, run pairing, casesHash,
+#                score self-consistency).
+#   It never adopts, installs, or overwrites the live SKILL.md — the draft stops
+#   at `ready` for the human, exactly like the pipeline it packages.
+
+- insert:
+    - id: skill-evolution-backtest
+      name: '@local/dsh-skill-evolution-backtest'
+      config:
+        # Where the Mnemon skill-evolution ledgers live. Defaults shown match the
+        # stock desktop layout (~/.mnemon/skills). Override only if yours differs.
+        ledgerPath: 'C:\\Users\\15940\\.mnemon\\skills\\ledger.json'
+        evalsPath: 'C:\\Users\\15940\\.mnemon\\skills\\evals.json'
+        # Root of the live skills this pipeline improves (each skill is
+        # <skillsRoot>/<skillName>/SKILL.md). The baseHash of a draft is the
+        # sha256 of that file's bytes at draft time.
+        skillsRoot: 'C:\\Users\\15940\\.dsh\\skills'
+        # Master switch for the mutating `write` tool. When false, `write`
+        # reports what it WOULD do and touches nothing — safe for a dry run.
+        allowWrite: true
+        # Number of timestamped backups of ledger.json/evals.json to keep in
+        # <plugin state dir>/backups before the oldest is dropped. Every write
+        # backs up first, so a bad write is always one file-copy away from undone.
+        backupKeep: 20
+        # Stamping on the runs this plugin writes, so a human can tell a
+        # tool-driven backtest from a hand-run one at a glance.
+        model:
+          provider: workbuddy
+          model: hy4free
+        # Cap on simultaneously running evolution worker agents when the panel
+        # triggers "进化所选". The host agent service runs them concurrently; this
+        # coordinator-level gate limits how many at once (1..16, default 3).
+        maxConcurrency: 3
+        # The note stamped on every anchor-graded check row. Kept in config so
+        # the grading semantics stay auditable from the patch file.
+        gradeNote: '锚点评分：该 check 通过=其锚点正则均在技能正文命中；score=通过 check 占比（部分分，对齐宿主 runScore）。'

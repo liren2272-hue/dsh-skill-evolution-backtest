@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- skill-evolution-backtest: a skill doc being graded before/after -->
+  <rect x="3" y="2" width="26" height="28" rx="3" fill="#1f2937"/>
+  <rect x="7" y="7" width="14" height="2" rx="1" fill="#9ca3af"/>
+  <rect x="7" y="11" width="18" height="2" rx="1" fill="#6b7280"/>
+  <!-- before: hollow check -->
+  <circle cx="9" cy="18" r="2.4" fill="none" stroke="#f87171" stroke-width="1.6"/>
+  <path d="M8 18 l1 1 l2 -2.2" fill="none" stroke="#f87171" stroke-width="1.4"/>
+  <rect x="13" y="17" width="12" height="2" rx="1" fill="#7f1d1d"/>
+  <!-- after: solid check -->
+  <circle cx="9" cy="24" r="2.4" fill="none" stroke="#4ade80" stroke-width="1.6"/>
+  <path d="M8 24 l1 1 l2 -2.2" fill="none" stroke="#4ade80" stroke-width="1.6"/>
+  <rect x="13" y="23" width="12" height="2" rx="1" fill="#14532d"/>
+</svg>
