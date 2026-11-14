@@ -1,10 +1,10 @@
 {
   "name": "@local/dsh-skill-evolution-backtest",
-  "version": "1.8.0",
+  "version": "1.12.0",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",
-  "description": "Packages the deterministic half of the Mnemon skill-evolution pipeline as agent tools: scan pending suggestions, per-check partial-score backtest of a candidate draft vs the current SKILL.md, atomic ledger write with backup + concurrency guard, and independent re-read verification. The creative half (writing the improved SKILL.md) stays with the agent.",
+  "description": "Packages the deterministic half of the Mnemon skill-evolution pipeline as agent tools: scan pending suggestions, host-aligned semantic backtest of a candidate draft vs the current SKILL.md (LLM judge per check + must-weighted case-level score, anchors as offline fallback), atomic ledger write with backup + concurrency guard, and independent re-read verification. The creative half (writing the improved SKILL.md) stays with the agent.",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -28,6 +28,7 @@
     "lib/paths.mjs",
     "lib/hash.mjs",
     "lib/grade.mjs",
+    "lib/llm-judge.mjs",
     "lib/ledger.mjs",
     "lib/vendor/yaml",
     "lib/client/index.js",

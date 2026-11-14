@@ -16,17 +16,25 @@ Mnemon 记忆插件会进化技能：后台 review 产出 `suggestions`（「这
 | 工具 | 读写 | 作用 |
 | --- | --- | --- |
 | `skill_evolution_scan` | 只读 | 列出 pending/review/expired 建议 + baseHash 新鲜度（FRESH/STALE/MISSING 对照活文件）+ 已有 draftId / lastError |
-| `skill_evolution_backtest` | 只读 | 候选草案 vs 当前 SKILL.md 做**逐 check 部分分**回测（锚点法，score=通过 check/总 check，对齐宿主 runScore），返回 before/after/Δ 与逐 check 明细（含缺失锚点） |
+| `skill_evolution_backtest` | 只读 | 候选草案 vs 当前 SKILL.md 做**语义回测**（模型逐 check 判定正文是否真正满足该改进点，锚点仅作离线回退；case 分按 must 加权、run 分取 case 级均值，对齐宿主 runScore），返回 before/after/Δ、passRate、评分引擎与逐 check 明细（含缺失锚点/判定理由） |
 | `skill_evolution_write` | **写** | 把一次回测落成 `status='ready'` 草案 + before/after run 对；**写盘前先做 frontmatter 加载门校验**（用与 DSH 完全相同的 yaml@2.9.1 解析器复刻 `parseSkillFile`：首行 `---`、闭合 `---`、YAML 映射、name+description 必填、kebab-case 技能名、legacy invocation key 拒写、invocation 布尔型校验、metadata 必须是映射），任一不过直接抛错、绝不写盘；随后时间戳备份两本账本、守卫（建议已采纳/已挂 draftId 拒写、baseHash 按活文件现算）后原子写（generation+1），建议翻成 review+draftId |
 | `skill_evolution_verify` | 只读 | 独立回读 write 落地结果，复查每条不变量（建议 review+draftId / baseHash 匹配 / before-after run 成对 / after hash=草案 / casesHash 成对 / 分数自洽） |
 
 **这些工具从不采纳、从不安装、从不覆盖正式 SKILL.md** —— 草案停在 `ready` 等人批准，跟它所打包的流水线一模一样。`write` 受 `allowWrite` 开关控制，且每次写前必备份。
 
-## 逐 check 部分分（锚点法）
+## 评分（与宿主 runScore 全量对齐）
 
-一个改进只有当**具体知识点真的落进正文**才算数。锚点是一条正则，是那段知识**必须**命中的；一个 check 通过=它的**全部**锚点都命中正文；case 分数=通过 check/总 check。所以修好 3 个 check 里 2 个的草案得 0.667，而不是非 0 即 1。
+评分口径与记忆插件（`dsh-mnemon-source-skills`）的宿主实现一致：
 
-**锚点校准教训**：锚点必须锚「技能级知识点」，绝不能锚某个案例专属串（如某个示例才用的 `/go` 路由、`sandbox_permissions` token）。锚了案例专属串会让 `before` 假红（假阴性）或 `after` 假绿（假阳性），整个回测就在撒谎。看到 `before=0` 先回头重读锚点，确认每条都是真缺的知识点。
+- **LLM 语义判定**：模型逐 check 判断正文是否**真正满足**该改进点（不是字面出现就算）。为减少小/快判题模型漏判导致的锚点回退，判题做了**补判 + 重试**：每个 case 首次调用若漏掉部分 check，**只针对缺失的 check 再问一次**并合并判定；首次输出不可解析时**重试一次**；只有补判/重试后仍缺、或模型不可达/报错，该 check/case 才回退锚点正则。评分引擎字段记录 provenance（`llm` / `anchor` / `llm+anchor`）。
+- **must 加权**：`must:true` 的 check 权重 2，普通 check 权重 1；**case 的 verdict 仅当所有 must check 通过才为 pass**（must 未过即 fail，普通 check 未过只拉低 case 分、不 gate）。
+- **case 级平均**：case 分 = 加权通过 / 总权重；run 分 = 各 case 分的均值（macro-average，非 check 级 micro-average）；run 的 `passRate` = 通过 case / 有分 case，与宿主 `runScore` 一致。
+
+**粒度**：score 是 case 级加权平均，case 的 check 太少会让分数坍成粗台阶（如 1/5=0.2、4/5=0.8），掩盖部分回退。每个 case 请拆成至少 6–8 个独立 check（一个断言一个 check），分数才能真正区分强草案与弱草案。
+
+**锚点校准教训**：锚点（回退用）必须锚「技能级知识点」，绝不能锚某个案例专属串（如某个示例才用的 `/go` 路由、`sandbox_permissions` token）。锚了案例专属串会让 `before` 假红（假阴性）或 `after` 假绿（假阳性），整个回测就在撒谎。看到 `before=0` 先回头重读锚点，确认每条都是真缺的知识点。
+
+**对齐边界**：本插件的「对齐宿主 runScore」指**分数形式**（0~1 通过率、逐 check 部分分、case 级平均、must 加权）与宿主 `runScore`/`compareAutomaticSkillRuns` 一致；判定主体由本插件的模型判断代替宿主评估 agent，锚点仅为本插件新增的离线回退层（宿主无锚点）。
 
 ## frontmatter 加载门（m01144）
 
@@ -77,6 +85,25 @@ Mnemon 记忆插件会进化技能：后台 review 产出 `suggestions`（「这
 - **无子代理则自己干（B 模式降级）**：若主代理发现自己**无法派发子代理**（没有 subagent 工具、或 spawn 被拒/不可用），**不许卡住或报失败**——降级为**自己逐个技能**跑进化流水线（scan → 读 live SKILL.md → 起草 → backtest → write），再 verify 落地草案。即便单干也**绝不采纳/安装/覆盖正式 SKILL.md**，成稿仍只以 `ready` 草案停在面板等人批准。这与「技能进化编排：无法派发 subagent 时默认 B 模式自己干」的既定授权一致。
 - **体积守卫（SIZE GUARD）**：写完草案后估算体积，超过安全线就**收紧**——合并重复章节、删冗余散文与过期/重叠的 Pitfalls、把冗长示例压到承重的命令/路径/API 行——但**保留全部可执行细节**（命令、路径、API 名、代码围栏）与仍有效内容。口径取自项目实测：`draftMaxTokens`=32768 输出 token 硬顶、中文密集文本 ≈2 字节/token，故**字节安全线 <50KB（≈<25K token），不是 30KB**；草案**本就 <50KB 就别再压**——再压只会删掉可用细节，违背保真要求。
 
+## 子代理工具挂载（m03118，1.11.0）
+
+**问题**：1.10.0 之前「进化所选」拉起的编排主代理，**全部没有 `subagent` 工具**——真实会话日志里 11 个编排主代理会话工具目录里均无 `subagent`，实际派发次数为 0，全部走 B 模式自干。模型说「无法开子代理」是**如实**，不是偷懒。
+
+**根因**：出货的 `standard` 预设里委派工具所在的 delegation 组声明带 **`isolate: { workflowEngine: true }`**——该组（`tool-subagent` / `tool-subagent-fork` / `tool-subagent-control` / `workflow-ptc`）**仅在 workflow 引擎激活时才挂载**。插件原先只给 `agents.create` 传 `meta.agentPreset: 'standard'`，而 `agentPreset` **只写进会话 header、不触发组合挂载**，且插件未激活 workflow 引擎、未传 `setup` → 隔离的委派组从不进入主代理工具目录。对照：普通会话工具目录里有 `subagent` 的 2117 个，全是 workflow 引擎激活的会话；同一份 standard 预设，引擎激活才有这个工具。
+
+**修复**：`spawnMainAgent` 给 `agents.create` 补 `setup` 回调，复刻宿主 `composeAgent` 的做法——从 `agentCtx` 取 `agentPresets` 服务，调 `presets.mount(agentCtx, 'standard')` 把预设组合（含隔离委派组）挂进 agent 的 scoped world，`subagent` / `subagent_fork` / `send_message` / `list_agents` 才随组合进入工具目录：
+
+```js
+setup: async (agentCtx) => {
+  const presets = agentCtx.get('agentPresets')
+  if (presets && typeof presets.mount === 'function') {
+    await presets.mount(agentCtx, 'standard')
+  }
+},
+```
+
+`agentPreset` 仍照常传 `meta.agentPreset: 'standard'`（写 header，供会话首回合预设选定），**但真正让工具进目录的是这条 `setup`**。自测 `[7]` 新增三项断言：`meta.agentPreset=standard`、`setup` 是函数、调用 `setup` 时 `agentPresets.mount(agentCtx, 'standard')` 被真实触发。即便该挂载在某些环境失败，`agentPreset` 与 setup 都做空值/能力守卫，**不会**让编排崩掉——回退到 B 模式自干的保护不变。
+
 ## 评分粒度（GRANULARITY，m03216，1.7.0）
 
 分数 = 通过的 check 数 / 总 check 数。若一个 case 只拆了少数几个 check，分数只能落在几个粗大的台阶上（如 1/5=0.2、4/5=0.8），看不出局部回退。本版本把「多拆 check」从 SKILL.md 的 Pitfall **提升进插件的进化提示与验证门**，让 evolve 代理真正产出细粒度分数：
@@ -113,6 +140,7 @@ Mnemon 记忆插件会进化技能：后台 review 产出 `suggestions`（「这
 | `/api/skill-evolution/state` | GET | 当前面板状态（每技能建议计数、类型、新鲜度、模型、勾选、**最大并发数**、阶段汇总、主代理编排状态） |
 | `/api/skill-evolution/config` | POST | 持久化 `{ model?: {provider, model}, selectedSkills?: string[], maxConcurrency?: number }`；maxConcurrency 非 1–16 整数返回 400，缺 model 字段返回 400，GET 误用返回 405 |
 | `/api/skill-evolution/evolve` | POST | 拉起**一个**真实 `standard` 主代理，按并发上限（软上限，写进主代理提示）开子代理跑进化流水线并逐草案审核+失败重试一次；`{ skills?, model? }`，model 优先级 body > 面板 > 宿主默认；先返回 `{ ok, orchestrator, maxConcurrency, queued[], skipped[], model }` 再 fire-and-forget；无勾选 400、GET 误用 405、宿主 agents 服务缺失 503 |
+| `/api/skill-evolution/run` | POST | **服务端桥接路由**：`{ op: 'backtest'|'write'|'verify', ...args }` 直接在进程内调用与 agent 工具**同一条** `gradeFor→judgeBody` 路径（LLM 语义判定 + must 加权 + case 级均值，锚点仅回退）。供无法直调 cordis 工具的会话 harness 脚本 POST 调用，避免它 import 锚点版 `gradeBody` 绕过 LLM 判定；未知 op 400、非 POST 405、异常 500 |
 | `/api/skill-evolution/jobs` | GET | 返回本进程拉起的进化任务列表（jobId/技能数/类型/阶段/错误），供面板轮询进度；主代理编排是单条任务 |
 
 ## 安装
@@ -139,7 +167,9 @@ cordis 补丁只在启动时读取，装完需**完全退出并重开桌面端**
 | `backupKeep` | `20` | 两本账本的时间戳备份保留份数（写前必备份） |
 | `model` | `workbuddy/hy4free` | 写入 run 的 model 戳 |
 | `maxConcurrency` | `3` | 「进化所选」拉起的主代理可同时开的子代理上限（1–16）；作为**软上限**写进主代理提示，由 LLM 遵守，非代码硬卡 |
-| `gradeNote` | 锚点评分说明 | 戳在每个 check 行上，让评分语义可审计 |
+| `gradeNote` | LLM 语义评分说明 | 戳在每个 check 行上，让评分语义可审计 |
+| `gradeEngine` | `auto` | 评分引擎：`auto`=模型可达走 LLM 语义判定、不可达回退锚点；`llm` 强制模型判定；`anchor` 强制确定性锚点正则 |
+| `judgeTimeoutMs` | `120000` | 单次 LLM 判定的超时（毫秒）；超时该 case 回退锚点 |
 
 ## 自测
 
@@ -148,6 +178,8 @@ node selftest.mjs
 ```
 
 离线跑，不碰真实 `~/.mnemon` 存储：在临时目录造假账本，验证部分分数学、casesHash 签名、run/draft 记录形状、pruneDrafts（ready 恒保留）、原子写+generation+1+建议翻 review、并发守卫、verify 全不变量。
+
+`[9]` 专门验证**服务端桥接路由** `/api/skill-evolution/run`：注入假 `llm.stream`，确认 `op:'backtest'` 真的走到 LLM 语义判定（`result.after.engine === 'llm'`，而非锚点回退），`op:'write'` 落 draft、`op:'verify'` 全不变量通过、未知 op 返 400——即 harness 脚本经 HTTP 调用时，评分链路与 agent 工具完全同源。
 
 客户端面板另有离线验收（会话内脚本，不进插件目录）：假 React 渲染冒烟测试（无宿主验证无运行时错误 + 统计 checkbox/table/select/style/button + i18n zh/en key 对齐全扁平 + 可见文案无 raw key，含「进化所选」按钮与类型徽章）；宿主四个 HTTP 端点离线干跑（假 webServer 直调 handler：GET state 对真实账本只读返回、POST config 落盘模型+勾选、POST evolve 假 agents 服务拉起任务+模型优先级+无勾选 400/无服务 503、GET jobs 列任务，负向 400/405、disposer 数组已收集）。样式令牌全部对 app.asar 抽出的 475 个真实 `--dsw-*` token 做差集清零（防深色崩）。
 

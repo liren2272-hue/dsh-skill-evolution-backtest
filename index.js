@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import { resolvePaths } from './lib/paths.mjs'
 import { sha256Hex, EMPTY_SHA, casesHash } from './lib/hash.mjs'
 import { gradeBody } from './lib/grade.mjs'
+import { judgeBody, GRADE_ENGINE } from './lib/llm-judge.mjs'
 import { readJson, writeJsonAtomic, backupLedgers, buildRun, newDraft, pruneDrafts, validateDraftSchema } from './lib/ledger.mjs'
 // Vendored yaml@2.9.1 — the SAME parser DSH uses to load SKILL.md frontmatter
 // (verified byte-for-byte against the desktop profile's yaml, and against the
@@ -43,9 +44,14 @@ function configure(cfg = {}) {
     // Concurrency cap for the evolution coordinator (m00648): how many worker
     // agents may run at once. Clamped 1..16; default 3.
     maxConcurrency: Math.min(16, Math.max(1, Number.isFinite(cfg.maxConcurrency) ? (cfg.maxConcurrency | 0) : 3)),
+    // Grading engine. 'auto' = LLM semantic judge when a model is reachable,
+    // anchors as the safe fallback; 'llm' forces the model judge; 'anchor'
+    // forces the deterministic regex grader.
+    gradeEngine: cfg.gradeEngine === 'llm' || cfg.gradeEngine === 'anchor' ? cfg.gradeEngine : 'auto',
+    judgeTimeoutMs: Number.isFinite(cfg.judgeTimeoutMs) ? cfg.judgeTimeoutMs : 120000,
     gradeNote:
       cfg.gradeNote ||
-      '锚点评分：该 check 通过=其锚点正则均在技能正文命中；score=通过 check 占比（部分分，对齐宿主 runScore）。',
+      'LLM 语义评分：模型逐 check 判定正文是否真正满足该改进点，锚点正则仅在模型不可用时回退；score=case 级加权平均（must=2，普通=1），对齐宿主 runScore。',
   }
   // Persist state (backups) next to the plugin, not the cwd, when possible.
   // NB: on Windows `new URL(...).pathname` yields "/C:/Users/..." (leading slash),
@@ -65,6 +71,16 @@ const readBody = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') 
 // normalization here (e.g. CRLF→LF) desynchronizes the two hashes for every file
 // that contains CRLF, making freshly-written drafts show as "已过期".
 const liveFileHash = (file) => (fs.existsSync(file) ? sha256Hex(fs.readFileSync(file)) : null)
+
+// Grade one skill body. `auto`/`llm` use the model judge (SVC.llm + CFG.model)
+// with the deterministic anchor grader as the safe fallback; `anchor` forces the
+// offline regex grader. Returns the host-aligned aggregate (case-level score +
+// must-weighted verdicts).
+async function gradeFor(body, cases) {
+  const engine = CFG.gradeEngine === 'anchor' ? GRADE_ENGINE.ANCHOR : CFG.gradeEngine
+  const signal = engine === GRADE_ENGINE.ANCHOR ? undefined : AbortSignal.timeout(CFG.judgeTimeoutMs)
+  return judgeBody(body, cases, { llm: SVC.llm, model: CFG.model, signal, engine })
+}
 
 // ---- tool: scan ----
 function scanImpl(args) {
@@ -104,24 +120,25 @@ function scanImpl(args) {
 }
 
 // ---- tool: backtest (read-only) ----
-function backtestImpl(args) {
+async function backtestImpl(args) {
   const skillName = String(args?.skillName || '')
   const draftContent = String(args?.draftContent ?? '')
   const cases = Array.isArray(args?.cases) ? args.cases : []
   if (!skillName) throw new Error('skillName is required')
-  if (!cases.length) throw new Error('cases must be a non-empty array of {id,title,checks:[{id,text,anchors:[]}]}')
+  if (!cases.length) throw new Error('cases must be a non-empty array of {id,title,checks:[{id,text,must?,anchors?}]}')
   const skillFile = CFG.skillFile(skillName)
   const current = readBody(skillFile)
   const currentNorm = current === null ? '' : current.replace(/\r\n/g, '\n')
-  const before = gradeBody(currentNorm, cases)
-  const after = gradeBody(draftContent.replace(/\r\n/g, '\n'), cases)
+  const before = await gradeFor(currentNorm, cases)
+  const after = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases)
   return {
     skillName,
     skillFileExists: current !== null,
-    before: { score: before.score, totalChecks: before.totalChecks, passedChecks: before.passedChecks, caseRows: before.caseRows },
-    after: { score: after.score, totalChecks: after.totalChecks, passedChecks: after.passedChecks, caseRows: after.caseRows },
+    before: { score: before.score, passRate: before.passRate, totalChecks: before.totalChecks, passedChecks: before.passedChecks, caseRows: before.caseRows },
+    after: { score: after.score, passRate: after.passRate, totalChecks: after.totalChecks, passedChecks: after.passedChecks, caseRows: after.caseRows },
     delta: Number((after.score - before.score).toFixed(4)),
-    note: 'score = 通过 check / 总 check（逐 check 部分分，对齐宿主 runScore）。',
+    engine: { before: before.engine, after: after.engine },
+    note: 'score = case 级加权平均（must=2，普通=1），对齐宿主 runScore；由模型逐 check 语义判定，模型不可用时回退锚点正则。',
   }
 }
 
@@ -207,7 +224,7 @@ export function validateSkillFrontmatter(content) {
 }
 
 // ---- tool: write (mutating) ----
-function writeImpl(args) {
+async function writeImpl(args) {
   if (!CFG.allowWrite) {
     return { dryRun: true, would: 'build a ready draft + before/after runs and atomic-write both ledgers (config.allowWrite=false → nothing touched)' }
   }
@@ -271,7 +288,8 @@ function writeImpl(args) {
     c.updatedAt = now
     for (const k of c.checks || []) {
       if (!k.id) k.id = randomUUID()
-      if (k.must === undefined) k.must = true
+      // Host-aligned: a check gates its case only when explicitly marked must.
+      if (k.must === undefined) k.must = false
     }
     if (!evalCases.some((x) => x.id === c.id)) evalCases.push(c)
   }
@@ -279,8 +297,8 @@ function writeImpl(args) {
 
   const draftId = randomUUID()
   const draftHash = sha256Hex(Buffer.from(draftContent, 'utf8'))
-  const beforeGraded = gradeBody(current === null ? '' : current.replace(/\r\n/g, '\n'), cases)
-  const afterGraded = gradeBody(draftContent.replace(/\r\n/g, '\n'), cases)
+  const beforeGraded = await gradeFor(current === null ? '' : current.replace(/\r\n/g, '\n'), cases)
+  const afterGraded = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases)
 
   const beforeRun = buildRun({
     id: randomUUID(), skillName, kind: 'current', hash: baseHash, draftId: null,
@@ -331,6 +349,9 @@ function writeImpl(args) {
     draftHash,
     beforeScore: beforeGraded.score,
     afterScore: afterGraded.score,
+    beforePassRate: beforeGraded.passRate,
+    afterPassRate: afterGraded.passRate,
+    engine: { before: beforeGraded.engine, after: afterGraded.engine },
     generation: ledger.generation,
     ready: ledger.drafts.filter((d) => d.status === 'ready').length,
     runs: evals.runs.length,
@@ -371,9 +392,20 @@ function verifyImpl(args) {
       checks.beforeHashMatchesLive = b.target?.hash === (liveHash ?? EMPTY_SHA)
       checks.casesHashPaired = b.casesHash === a.casesHash
       checks.singleCaseFocused = b.caseIds?.length === 1 && a.caseIds?.length === 1
-      const ap = a.results?.[0]?.checks?.filter((k) => k.pass).length
-      const at = a.results?.[0]?.checks?.length
-      checks.afterScoreSelfConsistent = at > 0 && Math.abs(a.score - ap / at) < 1e-9
+      // Host-aligned self-consistency: recompute the run aggregate from the
+      // stored per-case rows (score = mean of case scores, passRate = pass /
+      // graded) and require the stored run score/passRate to match exactly.
+      const gradedRows = (a.results || []).filter((r) => r.verdict !== 'error')
+      const recomputedScore = gradedRows.length
+        ? gradedRows.reduce((s, r) => s + (Number(r.score) || 0), 0) / gradedRows.length
+        : 0
+      const recomputedPassRate = gradedRows.length
+        ? gradedRows.filter((r) => r.verdict === 'pass').length / gradedRows.length
+        : 0
+      const passRateOk =
+        typeof a.passRate === 'number' ? Math.abs(a.passRate - recomputedPassRate) < 1e-9 : true
+      checks.afterScoreSelfConsistent =
+        gradedRows.length > 0 && Math.abs(a.score - recomputedScore) < 1e-9 && passRateOk
       // m03216 granularity gate: a coarse check count collapses the score into a few
       // big steps (1/5=0.2, 4/5=0.8). Require enough checks across all cases so the
       // score is actually fine-grained; an under-decomposed case set is a defect.
@@ -586,6 +618,12 @@ function readReqBody(request) {
 // agent.followup({content:[{type:'text',text}], source:{kind:'user'}}) and
 // agent.whenIdle(); agentPreset:'standard' is REQUIRED (inherit-the-user-default
 // can neither read files nor call host tools).
+// m03118: agentPreset alone only writes the session header — the standard
+// preset's delegation group is `isolate: { workflowEngine: true }`, so a
+// `setup` callback that calls agentPresets.mount(agentCtx, 'standard') is ALSO
+// required to mount the composition (and thus the `subagent` tool) into the
+// spawned agent. Without it the orchestrator never sees `subagent` and falls
+// back to B-mode solo work.
 const RUNNING = new Map() // jobId → job record the panel polls via GET /jobs
 const SVC = {} // resolved host services: agents / agentDefaultModel / sessions
 
@@ -631,11 +669,11 @@ function buildEvolvePrompt(skillName, suggestions, action) {
     '3b. SIZE GUARD — keep the draft under the output-token budget. dsh-mnemon draftMaxTokens = 32768 tokens; Chinese-dense text ≈ 2 bytes/token, so the byte safety line is <50KB (≈<25K tokens). After writing the draft, estimate its size: if it would exceed ~50KB, TIGHTEN IT — merge duplicate sections, drop redundant prose and stale/overlapping Pitfalls, compress verbose examples to their load-bearing command/path/API lines — while preserving every executable detail (commands, paths, API names, code fences) and all still-valid content. If the draft is already under ~50KB, leave it alone: do NOT over-compress, that only deletes usable detail.'
   )
   lines.push(
-    '4. Build improvement-point cases[] = [{id?, title, checks:[{id?, text, anchors:[regex...]}]}]. A check passes iff ALL its anchor regexes hit the body. Anchor on the SKILL-LEVEL knowledge the improvement adds — never a case-specific string or an over-strict anchor you invented, or the score lies.',
-    '4b. GRANULARITY (IMPORTANT — this decides score granularity). The score is passedChecks / totalChecks, so a case with only a handful of checks can only ever produce coarse steps (e.g. 1/5 = 0.2, 4/5 = 0.8) and hides partial regressions. For EVERY case, decompose the improvement into at least 6–8 independent, individually-anchorable checks (target ~6 per case, more for a dense change) — one check per distinct assertion the improvement should guarantee (a contract honored, a pitfall recorded, a wrong pattern forbidden, a worked example present, a cross-reference correct, ...). NEVER lump several assertions into one broad check. More fine-grained checks = a score that actually distinguishes a strong draft from a weak one; a near-flat score (e.g. all cases ≈0.2/0.8) is a signal you under-decomposed, so split the checks further and re-backtest.'
+    '4. Build improvement-point cases[] = [{id?, title, checks:[{id?, text, must?, anchors?}]}]. A model judges each check against the body (does the skill genuinely satisfy the improvement?), so write the check text as the INTENT of the improvement, not a literal string to match. Mark load-bearing checks must:true (the case only passes when they do); use anchors only as an optional offline fallback. Judge intent, never a case-specific string or an over-strict anchor you invented, or the score lies.',
+    '4b. GRANULARITY (IMPORTANT — this decides score granularity). The score is the case-level mean of must-weighted check scores, so a case with only a handful of checks can only ever produce coarse steps (e.g. 1/5 = 0.2, 4/5 = 0.8) and hides partial regressions. For EVERY case, decompose the improvement into at least 6–8 independent, individually-judged checks (target ~6 per case, more for a dense change) — one check per distinct assertion the improvement should guarantee (a contract honored, a pitfall recorded, a wrong pattern forbidden, a worked example present, a cross-reference correct, ...). NEVER lump several assertions into one broad check. More fine-grained checks = a score that actually distinguishes a strong draft from a weak one; a near-flat score (e.g. all cases ≈0.2/0.8) is a signal you under-decomposed, so split the checks further and re-backtest.'
   )
   lines.push(
-    '5. Call skill_evolution_backtest with skillName + draftContent + cases[] to get before/after partial scores (score = passed checks / total checks). If after is not clearly >= before, refine the draft or the anchors.'
+    '5. Call skill_evolution_backtest with skillName + draftContent + cases[] to get before/after case-level scores and pass rates. If after is not clearly >= before, refine the draft or the checks.'
   )
   lines.push(
     '6. Call skill_evolution_write once per open suggestion (they may share the same draftContent): pass skillName, suggestionId, action, draftContent, notes (≤2000 chars on what changed), cases[]. Skip any suggestion that already has a draftId — the tool refuses those. This lands a status=ready draft + a before/after run pair.'
@@ -693,6 +731,19 @@ async function spawnMainAgent(skills, model, maxConcurrency) {
     sessionId,
     meta: { cwd: CFG.skillsRoot, agentPreset: 'standard' },
     agentOptions: model ? { provider: model.provider, model: model.model } : undefined,
+    // m03118: meta.agentPreset only writes the session header. The standard
+    // preset's delegation group (tool-subagent / tool-subagent-fork) is declared
+    // with `isolate: { workflowEngine: true }`, so its tools are NOT mounted
+    // unless the preset composition itself is mounted into the agent. Replicate
+    // the host's composeAgent() setup here: mount the 'standard' composition via
+    // agentPresets. Without this the orchestrator's tool list lacks `subagent`
+    // and the model correctly falls back to B-mode solo work.
+    setup: async (agentCtx) => {
+      const presets = agentCtx.get('agentPresets')
+      if (presets && typeof presets.mount === 'function') {
+        await presets.mount(agentCtx, 'standard')
+      }
+    },
   })
   const agent = handle.agent
   const job = {
@@ -849,6 +900,32 @@ function registerPanelRoutes(ctx) {
       } catch (e) { writeJson(response, 500, { error: String(e && e.message || e) }) }
     })
 
+    // POST { op: 'backtest'|'write'|'verify', ...args } → run the matching
+    // pipeline step IN-PROCESS, using the exact same gradeFor()/SVC.llm path the
+    // agent tools use. This is the server-side bridge for session harness scripts
+    // that cannot call the cordis tools directly: a hand-rolled harness that
+    // imports lib/grade.mjs's anchor-only gradeBody() would silently grade with
+    // regexes and never reach the LLM semantic judge. Routing through here
+    // guarantees the LLM judge (with anchor fallback) is used.
+    register('/api/skill-evolution/run', async (request, response) => {
+      if (request.method !== 'POST') { writeJson(response, 405, { error: 'method not allowed' }); return }
+      try {
+        const body = JSON.parse((await readReqBody(request)).toString('utf8') || '{}')
+        const op = String(body.op || '').trim()
+        if (op === 'backtest') {
+          writeJson(response, 200, { ok: true, result: await backtestImpl(body) })
+        } else if (op === 'write') {
+          writeJson(response, 200, { ok: true, result: await writeImpl(body) })
+        } else if (op === 'verify') {
+          writeJson(response, 200, { ok: true, result: verifyImpl(body) })
+        } else {
+          writeJson(response, 400, { error: "op must be 'backtest', 'write' or 'verify'" })
+        }
+      } catch (e) {
+        writeJson(response, 500, { error: String(e && e.message || e) })
+      }
+    })
+
     // GET → spawn jobs the panel polls to show live evolution progress.
     register('/api/skill-evolution/jobs', async (_request, response) => {
       const jobs = [...RUNNING.values()]
@@ -892,7 +969,7 @@ export function apply(ctx, config = {}) {
       sctx.tools.register({
         name: 'skill_evolution_backtest',
         description:
-          'Per-check PARTIAL-SCORE backtest of a candidate improved SKILL.md against the current live one. You supply skillName, the full draftContent, and cases[] = [{id?,title,checks:[{id?,text,anchors:[regex...]}]}]. Each check passes iff ALL its anchor regexes hit the body; case score = passed/total checks (aligned with host runScore). Returns before/after scores, delta and the per-check breakdown incl. missing anchors. Read-only — nothing is written. Anchor on skill-level knowledge, never a case-specific string, or the scores lie.',
+          'Per-check semantic backtest of a candidate improved SKILL.md against the current live one, graded the way the Mnemon host does. You supply skillName, the full draftContent, and cases[] = [{id?,title,checks:[{id?,text,must?,anchors?}]}]. A model judges each check against the body (does the skill actually satisfy the improvement?), anchors are only the offline fallback, case score is must-weighted (must=2, optional=1), and the run score is the case-level mean (passRate = pass cases / graded cases). Returns before/after scores + pass rates, delta, the grading engine, and the per-check breakdown. Read-only — nothing is written. Mark load-bearing checks must:true so a case only passes when they do.',
         parameters: {
           type: 'object',
           properties: {
@@ -913,9 +990,10 @@ export function apply(ctx, config = {}) {
                       properties: {
                         id: { type: 'string' },
                         text: { type: 'string' },
-                        anchors: { type: 'array', items: { type: 'string' }, description: 'Regexes that must all hit the body for this check to pass.' },
+                        must: { type: 'boolean', description: 'Load-bearing check: the case only passes when this check does.' },
+                        anchors: { type: 'array', items: { type: 'string' }, description: 'Optional fallback regexes; used only if the model judge is unavailable.' },
                       },
-                      required: ['text', 'anchors'],
+                      required: ['text'],
                     },
                   },
                 },
@@ -926,13 +1004,13 @@ export function apply(ctx, config = {}) {
           required: ['skillName', 'draftContent', 'cases'],
         },
         output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
-        execute: (args) => j(backtestImpl(args)),
+        execute: async (args) => j(await backtestImpl(args)),
       })
 
       sctx.tools.register({
         name: 'skill_evolution_write',
         description:
-          'MUTATING: turn a graded improvement into a status=ready Mnemon draft + a before/after run pair, atomic-write both ledgers (generation+1) after timestamped backups, and flip the suggestion to review with draftId set. Guards: refuses if the suggestion is adopted/dismissed or already has a draftId; baseHash is recomputed from the live file. The draft stops at ready for human approval — it does NOT adopt, install, or overwrite the live SKILL.md. Provide skillName, suggestionId, action(update|create), draftContent, notes, cases[] (same shape as backtest).',
+          'MUTATING: turn a graded improvement into a status=ready Mnemon draft + a before/after run pair, atomic-write both ledgers (generation+1) after timestamped backups, and flip the suggestion to review with draftId set. Grading is host-aligned: a model judges each check semantically (anchors only as fallback), case score is must-weighted (must=2, optional=1), run score is the case-level mean. Guards: refuses if the suggestion is adopted/dismissed or already has a draftId; baseHash is recomputed from the live file. The draft stops at ready for human approval — it does NOT adopt, install, or overwrite the live SKILL.md. Provide skillName, suggestionId, action(update|create), draftContent, notes, cases[] (same shape as backtest).',
         parameters: {
           type: 'object',
           properties: {
@@ -960,7 +1038,7 @@ export function apply(ctx, config = {}) {
                         must: { type: 'boolean' },
                         anchors: { type: 'array', items: { type: 'string' } },
                       },
-                      required: ['text', 'anchors'],
+                      required: ['text'],
                     },
                   },
                 },
@@ -971,13 +1049,13 @@ export function apply(ctx, config = {}) {
           required: ['skillName', 'suggestionId', 'action', 'draftContent', 'cases'],
         },
         output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
-        execute: (args) => j(writeImpl(args)),
+        execute: async (args) => j(await writeImpl(args)),
       })
 
       sctx.tools.register({
         name: 'skill_evolution_verify',
         description:
-          'Independently re-read a ready draft (or all ready drafts) and recheck every invariant the write should have satisfied: suggestion flipped to review+draftId, baseHash matches the live file, content intact, before/after run pair present with correct current/draft targets, after hash matches the draft, casesHash paired, single focused case, after score self-consistent with its per-check rows, and granularityOk (the after run carries enough checks (>=6 total) that the score is actually fine-grained rather than collapsed into coarse ~0.2/0.8 steps). Read-only; returns allOk plus a per-draft check table.',
+          'Independently re-read a ready draft (or all ready drafts) and recheck every invariant the write should have satisfied: suggestion flipped to review+draftId, baseHash matches the live file, content intact, before/after run pair present with correct current/draft targets, after hash matches the draft, casesHash paired, single focused case, after score/passRate self-consistent with the per-case rows (host-aligned case-level aggregate), and granularityOk (the after run carries enough checks (>=6 total) that the score is actually fine-grained rather than collapsed into coarse ~0.2/0.8 steps). Read-only; returns allOk plus a per-draft check table.',
         parameters: {
           type: 'object',
           properties: { draftId: { type: 'string', description: 'Verify one ready draft. Omit to verify all ready drafts.' } },

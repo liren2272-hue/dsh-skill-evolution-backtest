@@ -56,6 +56,15 @@
         # triggers "进化所选". The host agent service runs them concurrently; this
         # coordinator-level gate limits how many at once (1..16, default 3).
         maxConcurrency: 3
-        # The note stamped on every anchor-graded check row. Kept in config so
-        # the grading semantics stay auditable from the patch file.
-        gradeNote: '锚点评分：该 check 通过=其锚点正则均在技能正文命中；score=通过 check 占比（部分分，对齐宿主 runScore）。'
+        # The note stamped on every check row. Kept in config so the grading
+        # semantics stay auditable from the patch file. The score is host-aligned:
+        # a model judges each check semantically, anchors are the offline
+        # fallback, case score is must-weighted (must=2, optional=1), run score
+        # is the case-level mean.
+        gradeNote: 'LLM 语义评分：模型逐 check 判定正文是否真正满足该改进点，锚点正则仅在模型不可用时回退；score=case 级加权平均（must=2，普通=1），对齐宿主 runScore。'
+        # Grading engine. auto = LLM judge when a model is reachable, anchors as
+        # the safe fallback; llm forces the model judge; anchor forces the
+        # deterministic regex grader.
+        gradeEngine: auto
+        # Per-judge timeout in ms; on timeout that case falls back to anchors.
+        judgeTimeoutMs: 120000

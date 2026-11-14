@@ -10,6 +10,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { gradeBody } from './lib/grade.mjs'
+import { judgeBody, extractChecksJson, GRADE_ENGINE } from './lib/llm-judge.mjs'
 import { casesHash, sha256Hex, EMPTY_SHA } from './lib/hash.mjs'
 import { buildRun, newDraft, pruneDrafts, validateDraftSchema } from './lib/ledger.mjs'
 
@@ -48,6 +49,150 @@ ok(a.caseRows[0].checks[2].misses.length === 1, 'k3 reports 1 missing anchor')
 const bad = gradeBody('x', [{ id: 'c', title: 'x', checks: [{ id: 'k', text: 'x', anchors: ['(['] }] }])
 ok(bad.score === 0 && bad.caseRows[0].checks[0].misses[0].error === 'invalid regex', 'invalid regex => miss, no throw')
 
+// ---- 1b. must weighting + case-level macro-average (host compareAutomaticSkillRuns) ----
+console.log('\n[1b] must weighting + case-level aggregation')
+{
+  const mustCase = [{
+    id: 'm1', title: 'must-gated',
+    checks: [
+      { id: 'mk1', text: 'must hit', must: true, anchors: ['alpha'] },
+      { id: 'mk2', text: 'optional miss', must: false, anchors: ['zzz-not-here'] },
+    ],
+  }]
+  const g = gradeBody('has alpha', mustCase)
+  ok(g.caseRows[0].score === 2 / 3, 'must weight=2, optional=1 => 2/3', `got ${g.caseRows[0].score}`)
+  ok(g.caseRows[0].verdict === 'pass', 'optional miss does not gate the case')
+  ok(g.score === 2 / 3 && g.passRate === 1, 'single must-pass case aggregates to 2/3')
+
+  // A failing MUST check must gate the case verdict even though the case score
+  // is non-zero (the weighted partial).
+  const failMust = [{
+    id: 'm2', title: 'must-fail',
+    checks: [
+      { id: 'fk1', text: 'must hit', must: true, anchors: ['nope-missing'] },
+      { id: 'fk2', text: 'optional hit', must: false, anchors: ['alpha'] },
+    ],
+  }]
+  const g2 = gradeBody('has alpha', failMust)
+  ok(g2.caseRows[0].score === 1 / 3, 'must miss => 1/3 weighted', `got ${g2.caseRows[0].score}`)
+  ok(g2.caseRows[0].verdict === 'fail', 'failing must check gates case verdict')
+  ok(g2.score === 1 / 3 && g2.passRate === 0, 'must-fail case => passRate 0')
+
+  // Two cases => run score is the MEAN of case scores, not the check-level ratio.
+  const two = [
+    { id: 't1', title: 'c1', checks: [{ id: 't1k1', text: 'a', must: true, anchors: ['alpha'] }] },
+    { id: 't2', title: 'c2', checks: [
+      { id: 't2k1', text: 'b', must: true, anchors: ['beta'] },
+      { id: 't2k2', text: 'c', must: true, anchors: ['gamma'] },
+    ] },
+  ]
+  const g3 = gradeBody('has alpha only', two)
+  // case1: 1/1 = 1 ; case2: 0/2 = 0 ; run score = mean(1, 0) = 0.5
+  ok(g3.caseRows[0].score === 1 && g3.caseRows[1].score === 0, 'per-case scores 1 and 0')
+  ok(g3.score === 0.5, 'run score = mean of case scores (macro)', `got ${g3.score}`)
+  ok(g3.microScore === 1 / 3, 'microScore (check-level) kept for diagnostics', `got ${g3.microScore}`)
+}
+
+// ---- 1c. LLM semantic judge + deterministic fallback ----
+console.log('\n[1c] LLM judge (semantic) + anchor fallback')
+function fakeLlm(textOrThrow) {
+  return {
+    async *stream(_opts) {
+      if (textOrThrow instanceof Error) throw textOrThrow
+      const pieces = String(textOrThrow).match(/.{1,40}/gs) || []
+      for (const piece of pieces) yield { type: 'text-delta', index: 0, text: piece }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+}
+const judgeModel = { provider: 'p', model: 'm' }
+// JSON embedded in prose + code fence must still parse.
+ok(Array.isArray(extractChecksJson('Sure!\n```json\n[{"id":"k1","pass":true,"reason":"ok"}]\n```\nThanks')), 'extractChecksJson parses fenced JSON')
+ok(extractChecksJson('no array here') === null, 'extractChecksJson returns null on garbage')
+{
+  const cases = [{ id: 'j1', title: 't', checks: [
+    { id: 'jk1', text: 'has alpha', must: true, anchors: ['zzz-not-here'] },
+    { id: 'jk2', text: 'has beta', must: false, anchors: ['yyy-not-here'] },
+  ] }]
+  const llmText = JSON.stringify([
+    { id: 'jk1', pass: true, reason: 'alpha present' },
+    { id: 'jk2', pass: false, reason: 'beta absent' },
+  ])
+  const g = await judgeBody('alpha', cases, { llm: fakeLlm(llmText), model: judgeModel })
+  ok(g.engine === GRADE_ENGINE.LLM, 'LLM judge engine', `got ${g.engine}`)
+  ok(g.caseRows[0].checks[0].pass === true && g.caseRows[0].checks[1].pass === false, 'LLM verdicts applied')
+  ok(g.caseRows[0].checks[0].engine === GRADE_ENGINE.LLM, 'check engine is llm')
+  ok(g.score === 2 / 3 && g.caseRows[0].verdict === 'pass', 'must-weighted case score from LLM verdicts')
+}
+{
+  // Model call throws → whole case falls back to anchors (engine=anchor).
+  const cases = [{ id: 'j2', title: 't', checks: [{ id: 'jk1', text: 'x', must: true, anchors: ['alpha'] }] }]
+  const g = await judgeBody('has alpha', cases, { llm: fakeLlm(new Error('boom')), model: judgeModel })
+  ok(g.engine === GRADE_ENGINE.ANCHOR, 'model error => anchor engine', `got ${g.engine}`)
+  ok(g.caseRows[0].checks[0].pass === true, 'anchor fallback still grades the body')
+}
+{
+  // Model omits one check verdict → that check falls back to anchors (mixed).
+  const cases = [{ id: 'j3', title: 't', checks: [
+    { id: 'jk1', text: 'x', must: true, anchors: ['nope'] },
+    { id: 'jk2', text: 'y', must: true, anchors: ['alpha'] },
+  ] }]
+  const llmText = JSON.stringify([{ id: 'jk1', pass: true, reason: 'x present' }])
+  const g = await judgeBody('has alpha', cases, { llm: fakeLlm(llmText), model: judgeModel })
+  ok(g.engine === GRADE_ENGINE.MIXED, 'missing verdict => mixed engine', `got ${g.engine}`)
+  ok(g.caseRows[0].checks[1].engine === GRADE_ENGINE.ANCHOR, 'missing check uses anchor fallback')
+  ok(g.caseRows[0].checks[1].pass === true, 'anchor fallback for missing check')
+}
+{
+  // m03118: partial first response, but the repair pass fills the missing
+  // check's verdict → the whole case becomes llm (no anchor fallback at all).
+  const cases = [{ id: 'j5', title: 't', checks: [
+    { id: 'jk1', text: 'x', must: true, anchors: ['alpha'] },
+    { id: 'jk2', text: 'y', must: true, anchors: ['alpha'] },
+  ] }]
+  let call = 0
+  const seqLlm = {
+    async *stream(_opts) {
+      call++
+      const out = call === 1
+        ? [{ id: 'jk1', pass: true, reason: 'first pass' }]
+        : [{ id: 'jk2', pass: false, reason: 'repair pass' }]
+      const pieces = JSON.stringify(out).match(/.{1,40}/gs) || []
+      for (const piece of pieces) yield { type: 'text-delta', index: 0, text: piece }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const g = await judgeBody('has alpha', cases, { llm: seqLlm, model: judgeModel })
+  ok(call === 2, 'repair pass re-asks for the missing check', `calls=${call}`)
+  ok(g.engine === GRADE_ENGINE.LLM, 'partial first pass + repair => all llm engine', `got ${g.engine}`)
+  ok(g.caseRows[0].checks[1].engine === GRADE_ENGINE.LLM && g.caseRows[0].checks[1].pass === false, 'repaired check uses the LLM verdict')
+  ok(g.caseRows[0].score === 0.5 && g.caseRows[0].verdict === 'fail', 'repaired verdict feeds the must-weighted case score')
+}
+{
+  // m03118: first response unparseable, second parseable → still llm (no whole-case anchor).
+  const cases = [{ id: 'j6', title: 't', checks: [{ id: 'jk1', text: 'x', must: true, anchors: ['alpha'] }] }]
+  let call = 0
+  const retryLlm = {
+    async *stream(_opts) {
+      call++
+      const text = call === 1 ? 'not json at all' : JSON.stringify([{ id: 'jk1', pass: true, reason: 'retry ok' }])
+      const pieces = text.match(/.{1,40}/gs) || []
+      for (const piece of pieces) yield { type: 'text-delta', index: 0, text: piece }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const g = await judgeBody('has alpha', cases, { llm: retryLlm, model: judgeModel })
+  ok(call === 2, 'unparseable first pass is retried', `calls=${call}`)
+  ok(g.engine === GRADE_ENGINE.LLM, 'unparseable + retry => llm engine', `got ${g.engine}`)
+  ok(g.caseRows[0].checks[0].engine === GRADE_ENGINE.LLM, 'retried check uses the LLM verdict')
+}
+{
+  // No llm at all → anchor engine, still graded (never constant).
+  const cases = [{ id: 'j4', title: 't', checks: [{ id: 'jk1', text: 'x', must: true, anchors: ['alpha'] }] }]
+  const g = await judgeBody('has alpha', cases, { llm: null, model: judgeModel })
+  ok(g.engine === GRADE_ENGINE.ANCHOR && g.score === 1, 'no llm => anchor engine, graded')
+}
+
 // ---- 2. casesHash signature ----
 console.log('\n[2] casesHash (host skillCaseSignature)')
 const c2 = [{ id: 'c1', skillName: 's', title: 'T', prompt: 'P', context: '', enabled: true, requiresVision: false, checks: [{ id: 'k1', text: 'x', must: true }] }]
@@ -64,8 +209,9 @@ console.log('\n[3] run/draft record shape')
 const graded = gradeBody(afterBody, cases)
 const run = buildRun({ id: 'r1', skillName: 's', kind: 'draft', hash: 'h', draftId: 'd1', cases, graded, model: { provider: 'p', model: 'm' }, gradeNote: 'n', now: 'NOW' })
 ok(run.target.kind === 'draft' && run.target.draftId === 'd1' && run.target.hash === 'h', 'draft run target')
-ok(run.score === 2 / 3 && run.passRate === 2 / 3, 'run score = partial')
+ok(run.score === 2 / 3 && run.passRate === 1, 'run score = partial, passRate = pass/graded', `score=${run.score} passRate=${run.passRate}`)
 ok(run.results[0].checks.length === 3 && run.results[0].fullyGraded === true, 'run result rows')
+ok(run.results[0].verdict === 'pass', 'all-optional case verdict passes (no must gating)')
 const beforeRun = buildRun({ id: 'r0', skillName: 's', kind: 'current', hash: 'bh', draftId: null, cases, graded: b, model: { provider: 'p', model: 'm' }, gradeNote: 'n', now: 'NOW' })
 ok(beforeRun.target.kind === 'current' && beforeRun.target.draftId === null, 'before run target')
 const draft = newDraft({ suggestionId: 's1', skillName: 's', action: 'update', baseHash: 'bh', content: 'C', notes: 'N'.repeat(5000), runIds: ['r0', 'r1'], now: 'NOW' })
@@ -229,7 +375,13 @@ let writeOut
     beforeHashMatchesLive: b.target.hash === sha256Hex(Buffer.from(cur, 'utf8')),
     casesHashPaired: b.casesHash === a.casesHash,
     singleCaseFocused: b.caseIds.length === 1 && a.caseIds.length === 1,
-    afterScoreSelfConsistent: Math.abs(a.score - a.results[0].checks.filter((k) => k.pass).length / a.results[0].checks.length) < 1e-9,
+    afterScoreSelfConsistent: (() => {
+      const rows = (a.results || []).filter((r) => r.verdict !== 'error')
+      if (!rows.length) return false
+      const score = rows.reduce((s, r) => s + (Number(r.score) || 0), 0) / rows.length
+      const passRate = rows.filter((r) => r.verdict === 'pass').length / rows.length
+      return Math.abs(a.score - score) < 1e-9 && Math.abs(a.passRate - passRate) < 1e-9
+    })(),
   }
   const allOk = Object.values(checks).every((v) => v === true)
   ok(allOk, 'verify ALL invariants green', JSON.stringify(checks))
@@ -312,7 +464,7 @@ console.log('\n[6] REAL registered skill_evolution_write (apply() + frozen args)
   deepFreeze(args6)
   ok(Object.isFrozen(args6) && Object.isFrozen(args6.cases[0]) && Object.isFrozen(args6.cases[0].checks[0]), 'args deeply frozen')
   let out6, threw6 = ''
-  try { out6 = JSON.parse(cap.skill_evolution_write.execute(args6)) }
+  try { out6 = JSON.parse(await cap.skill_evolution_write.execute(args6)) }
   catch (e) { threw6 = String((e && e.message) || e) }
   ok(!threw6, 'REAL write did not throw', threw6)
   if (out6) {
@@ -343,13 +495,16 @@ console.log('\n[7] /evolve main agent: spawns ONE main agent that opens subagent
   const state = { active: 0, max: 0 }
   let agentCreates = 0
   let lastMainPrompt = ''
+  let lastCreateOpts = null
   const delay = (ms) => new Promise((r) => setTimeout(r, ms))
   // Fake MAIN agent: /evolve must spawn exactly ONE agent (the orchestrator).
   // Its followup prompt carries the concurrency instruction + one subagent-prompt
   // block per skill. whenIdle simulates the main agent opening subagents: each
   // subagent lands a ready draft for its skill via the real write tool.
   const fakeAgents = {
-    async create({ sessionId }) {
+    async create(opts) {
+      const { sessionId } = opts
+      lastCreateOpts = opts
       agentCreates++
       const agent = { session: { id: sessionId }, _prompt: '' }
       agent.followup = async ({ content }) => { agent._prompt = (content && content[0] && content[0].text) || '' }
@@ -365,7 +520,7 @@ console.log('\n[7] /evolve main agent: spawns ONE main agent that opens subagent
           if (!sug) continue
           const draft = `---\nname: ${skill}\ndescription: main-agent e2e fixture\n---\n\n# ${skill}\n\nGOODANCHOR present in improved body\n`
           try {
-            cap.skill_evolution_write.execute({
+            await cap.skill_evolution_write.execute({
               skillName: skill, suggestionId: sug.id, action: 'update',
               draftContent: draft, notes: 'main-agent e2e', cases: [{ title: 't', checks: [{ text: 'c', anchors: ['GOODANCHOR'] }] }],
             })
@@ -438,6 +593,21 @@ console.log('\n[7] /evolve main agent: spawns ONE main agent that opens subagent
   const jobs = await pollUntil(['sev-a, sev-b, sev-c'])
   ok(Boolean(jobs), 'main-agent job reached terminal phase', jobs ? '' : 'timed out')
   ok(agentCreates === 1, 'exactly ONE main agent spawned (not per-skill workers)', `agentCreates=${agentCreates}`)
+  // m03118: meta.agentPreset alone only writes the session header — the standard
+  // preset's delegation group is `isolate: { workflowEngine: true }`, so the
+  // spawned agent MUST carry a setup callback that mounts the composition (and
+  // thus the `subagent` tool). Assert both the shape and the mount call.
+  ok(lastCreateOpts && lastCreateOpts.meta && lastCreateOpts.meta.agentPreset === 'standard', 'agents.create sets meta.agentPreset=standard')
+  ok(typeof lastCreateOpts?.setup === 'function', 'agents.create passes a setup callback')
+  let mountCalledWith = null
+  const fakeAgentCtx = {
+    get(name) {
+      if (name === 'agentPresets') return { mount: async (ctx, id) => { mountCalledWith = id } }
+      return undefined
+    },
+  }
+  await lastCreateOpts.setup(fakeAgentCtx, {})
+  ok(mountCalledWith === 'standard', "setup mounts the 'standard' preset composition", `mountCalledWith=${mountCalledWith}`)
   if (jobs) {
     const j = jobs[0]
     ok(j.skillCount === 3, 'main-agent job tracks skillCount=3', `skillCount=${j.skillCount}`)
@@ -552,7 +722,7 @@ whenToUse: 注入工具被拒时${extra}
   const badDraft = unclosedQuote + '\n\n# body\nGOODANCHOR here\n'
   let threwWrite = '', wroteLedger = false
   try {
-    cap.skill_evolution_write.execute({
+    await cap.skill_evolution_write.execute({
       skillName: 'fm-skill', suggestionId: 'fm-sug', action: 'update',
       draftContent: badDraft, notes: 'broken', cases: [{ title: 't', checks: [{ text: 'c', anchors: ['GOODANCHOR'] }] }],
     })
@@ -566,12 +736,108 @@ whenToUse: 注入工具被拒时${extra}
   const goodDraft = goodFront() + '\n\n# body\nGOODANCHOR here\n'
   let goodOut, goodThrew = ''
   try {
-    goodOut = JSON.parse(cap.skill_evolution_write.execute({
+    goodOut = JSON.parse(await cap.skill_evolution_write.execute({
       skillName: 'fm-skill', suggestionId: 'fm-sug', action: 'update',
       draftContent: goodDraft, notes: 'ok', cases: [{ title: 't', checks: [{ text: 'c', anchors: ['GOODANCHOR'] }] }],
     }))
   } catch (e) { goodThrew = String((e && e.message) || e) }
   ok(!goodThrew && goodOut && goodOut.dryRun === false && Boolean(goodOut.draftId), 'REAL write tool lands good draft', goodThrew)
+}
+
+// ---- 9. /api/skill-evolution/run server-side bridge (harness -> real LLM judge) ----
+// A standalone session harness cannot call the cordis tools directly; it POSTs to
+// this route. The route must dispatch to the SAME backtestImpl/writeImpl/verifyImpl
+// the agent tools use, so the LLM semantic judge (not the anchor-only gradeBody)
+// is reached. A fake llm.stream proves the LLM verdict flows through the route.
+console.log('\n[9] /api/skill-evolution/run dispatches to the real pipeline (LLM judge)')
+{
+  const entry = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest9=' + Date.now())
+  const cap9 = {}
+  const handlers9 = {}
+  const fakeLlm = {
+    async *stream() {
+      yield { type: 'text-delta', text: JSON.stringify([{ id: 'k1', pass: true, reason: 'route reaches llm judge' }]) }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const fakeCtx9 = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap9[s.name] = s } }, effect: (fn) => fn() })
+      if (deps[0] === 'webServer') return cb({ webServer: { register(arg) { handlers9[arg.path] = arg.handler; return () => {} } } })
+      return cb({ agents: undefined, agentDefaultModel: { currentSelection: () => null }, sessions: { flush() {} }, llm: fakeLlm })
+    },
+  }
+  const r9 = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-run-'))
+  const skillsRoot9 = path.join(r9, 'skills')
+  const skillDir9 = path.join(skillsRoot9, 'rt-skill')
+  fs.mkdirSync(skillDir9, { recursive: true })
+  fs.writeFileSync(path.join(skillDir9, 'SKILL.md'), 'current body\n', 'utf8')
+  const ledgerPath9 = path.join(r9, 'ledger.json')
+  const evalsPath9 = path.join(r9, 'evals.json')
+  const stateDir9 = path.join(r9, 'state')
+  fs.mkdirSync(stateDir9, { recursive: true })
+  fs.writeFileSync(ledgerPath9, JSON.stringify({
+    generation: 1, suggestions: [{ id: 'rt-sug', skillName: 'rt-skill', action: 'update', status: 'pending' }], drafts: [],
+  }, null, 2), 'utf8')
+  fs.writeFileSync(evalsPath9, JSON.stringify({ cases: [], runs: [] }, null, 2), 'utf8')
+  entry.apply(fakeCtx9, {
+    ledgerPath: ledgerPath9, evalsPath: evalsPath9, skillsRoot: skillsRoot9,
+    stateDir: stateDir9, allowWrite: true, backupKeep: 5, model: { provider: 'p', model: 'm' },
+    gradeEngine: 'auto',
+  })
+  ok(Boolean(handlers9['/api/skill-evolution/run']), 'apply() registered /api/skill-evolution/run route')
+  const fakeReq9 = (method, bodyObj) => { const buf = Buffer.from(JSON.stringify(bodyObj || {})); return { method, on(ev, cb) { if (ev === 'data') cb(buf); else if (ev === 'end') cb() } } }
+  const fakeRes9 = () => ({ statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(b) { this.bodyStr = b ? b.toString('utf8') : '' } })
+
+  // backtest via route: the LLM verdict must reach the result (engine === 'llm').
+  {
+    const res = fakeRes9()
+    await handlers9['/api/skill-evolution/run'](fakeReq9('POST', {
+      op: 'backtest', skillName: 'rt-skill', draftContent: 'improved body',
+      cases: [{ id: 'c1', title: 't', checks: [{ id: 'k1', text: 'c', must: true, anchors: ['GOODANCHOR'] }] }],
+    }), res)
+    const body = JSON.parse(res.bodyStr)
+    ok(body.ok === true && body.result && body.result.engine && body.result.engine.after === 'llm', 'run op=backtest reaches LLM judge (engine=llm)', JSON.stringify(body).slice(0, 200))
+  }
+
+  // write via route lands a ready draft.
+  let wBody
+  {
+    const res = fakeRes9()
+    await handlers9['/api/skill-evolution/run'](fakeReq9('POST', {
+      op: 'write', skillName: 'rt-skill', suggestionId: 'rt-sug', action: 'update',
+      draftContent: '---\nname: rt-skill\ndescription: run route\n---\n\n# rt-skill\n\nGOODANCHOR here\n', notes: 'route write',
+      cases: [{
+        id: 'c1', title: 't',
+        checks: [
+          { id: 'k1', text: 'c1', must: true, anchors: ['GOODANCHOR'] },
+          { id: 'k2', text: 'c2', must: true, anchors: ['GOODANCHOR'] },
+          { id: 'k3', text: 'c3', must: true, anchors: ['GOODANCHOR'] },
+          { id: 'k4', text: 'c4', must: true, anchors: ['GOODANCHOR'] },
+          { id: 'k5', text: 'c5', must: true, anchors: ['GOODANCHOR'] },
+          { id: 'k6', text: 'c6', must: true, anchors: ['GOODANCHOR'] },
+        ],
+      }],
+    }), res)
+    wBody = JSON.parse(res.bodyStr)
+  }
+  ok(wBody.ok === true && Boolean(wBody.result && wBody.result.draftId), 'run op=write lands draft via route')
+
+  // verify via route on the landed draft.
+  {
+    const res = fakeRes9()
+    await handlers9['/api/skill-evolution/run'](fakeReq9('POST', { op: 'verify', draftId: wBody.result.draftId }), res)
+    const body = JSON.parse(res.bodyStr)
+    ok(body.ok === true && body.result && body.result.allOk === true, 'run op=verify returns allOk on landed draft', JSON.stringify(body).slice(0, 200))
+  }
+
+  // negative: unknown op -> 400.
+  {
+    const res = fakeRes9()
+    await handlers9['/api/skill-evolution/run'](fakeReq9('POST', { op: 'bogus' }), res)
+    ok(res.statusCode === 400, 'run rejects unknown op with 400', `got ${res.statusCode}`)
+  }
 }
 
 console.log(`\n${failures === 0 ? 'SELFTEST PASS' : `SELFTEST FAIL (${failures})`}`)
