@@ -482,6 +482,70 @@ console.log('\n[6] REAL registered skill_evolution_write (apply() + frozen args)
   }
 }
 
+// [8b] benign multi-case verify (singleCaseFocused demoted). A multi-subpoint
+// improvement legitimately lands one case per subpoint, which sets
+// checks.singleCaseFocused=false. That flag is informational, not a defect gate
+// (the coarse-granularity guard is granularityOk). Assert the REAL verify now
+// reports allOk=true for a benign multi-case draft while STILL surfacing
+// singleCaseFocused=false honestly in checks (flag not stripped).
+console.log('\n[8b] REAL verify treats benign multi-case as allOk=true (singleCaseFocused demoted)')
+{
+  const entry = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest=' + Date.now())
+  const cap = {}
+  const fakeCtx = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap[s.name] = s } }, effect(fn) { return fn() } })
+      if (deps[0] === 'webServer') return cb({ webServer: { register() { return () => {} } } })
+      return cb({ agents: undefined, agentDefaultModel: undefined, sessions: undefined, llm: undefined })
+    },
+  }
+  const r8b = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-multicase-'))
+  const skillsRoot8b = path.join(r8b, 'skills')
+  const skillDir8b = path.join(skillsRoot8b, 'multi-case-skill')
+  fs.mkdirSync(skillDir8b, { recursive: true })
+  const body8b = '# Multi Case Skill\n\nnothing here yet\n'
+  fs.writeFileSync(path.join(skillDir8b, 'SKILL.md'), body8b, 'utf8')
+  const ledgerPath8b = path.join(r8b, 'ledger.json')
+  const evalsPath8b = path.join(r8b, 'evals.json')
+  const stateDir8b = path.join(r8b, 'state')
+  fs.mkdirSync(stateDir8b, { recursive: true })
+  fs.writeFileSync(ledgerPath8b, JSON.stringify({
+    generation: 3,
+    suggestions: [{ id: 'r8b-sug', skillName: 'multi-case-skill', action: 'update', status: 'pending', summary: 's' }],
+    drafts: [],
+  }, null, 2), 'utf8')
+  fs.writeFileSync(evalsPath8b, JSON.stringify({ cases: [], runs: [] }, null, 2), 'utf8')
+  entry.apply(fakeCtx, {
+    ledgerPath: ledgerPath8b, evalsPath: evalsPath8b, skillsRoot: skillsRoot8b,
+    stateDir: stateDir8b, allowWrite: true, backupKeep: 5, model: { provider: 'p', model: 'm' },
+  })
+  const draft8b = `---\nname: multi-case-skill\ndescription: benign multi-case verify regression fixture\n---\n\n` + body8b + '\n\n## Subpoint A\n\nalpha anchor lives here.\n\n## Subpoint B\n\nbeta anchor lives here.\n'
+  // Two subpoints, one case each, 6 checks per case (granularityOk satisfied),
+  // every anchor hits draft-only text (Subpoint A / Subpoint B sections).
+  const mkCase = (id, anchor) => ({
+    id, title: 'subpoint ' + id,
+    checks: [1, 2, 3, 4, 5, 6].map((n) => ({ text: anchor + ' check ' + n, anchors: [anchor] })),
+  })
+  const args8b = {
+    skillName: 'multi-case-skill', suggestionId: 'r8b-sug', action: 'update',
+    draftContent: draft8b, notes: 'benign multi-case verify regression',
+    cases: [mkCase('c1', 'alpha anchor'), mkCase('c2', 'beta anchor')],
+  }
+  let out8b, threw8b = ''
+  try { out8b = JSON.parse(await cap.skill_evolution_write.execute(args8b)) }
+  catch (e) { threw8b = String((e && e.message) || e) }
+  ok(!threw8b, 'multi-case write did not throw', threw8b)
+  if (out8b) {
+    const v8b = JSON.parse(cap.skill_evolution_verify.execute({ draftId: out8b.draftId }))
+    const c8b = v8b.results && v8b.results[0] && v8b.results[0].checks
+    ok(v8b.allOk === true, 'benign multi-case verify reports allOk=true', JSON.stringify(c8b))
+    ok(c8b && c8b.singleCaseFocused === false, 'singleCaseFocused still surfaced as false (flag kept, not stripped)', JSON.stringify(c8b))
+    ok(c8b && c8b.granularityOk === true, 'granularityOk true (real coarse gate still enforced)', JSON.stringify(c8b))
+    ok(fs.readFileSync(path.join(skillDir8b, 'SKILL.md'), 'utf8') === body8b, 'live SKILL.md untouched (8b)')
+  }
+}
+
 // ---- 7. coordinator E2E (m00648): concurrency cap + review + retry-once ----
 // Drives the REAL /api/skill-evolution/evolve route with a fake host `agents`
 // service. The fake worker performs the write the real `skill_evolution_write`
@@ -586,7 +650,7 @@ console.log('\n[7] /evolve main agent: spawns ONE main agent that opens subagent
   // (honoured by the LLM main agent), so no code-enforced state.max assertion.
   agentCreates = 0; lastMainPrompt = ''
   const res = fakeRes()
-  await handlers['/api/skill-evolution/evolve'](fakeReq('POST', { skills: ['sev-a', 'sev-b', 'sev-c'] }), res)
+  await handlers['/api/skill-evolution/evolve'](fakeReq('POST', { skills: ['sev-a', 'sev-b', 'sev-c'], evolutionMode: 'legacy' }), res)
   const evBody = JSON.parse(res.bodyStr)
   ok(res.statusCode === 200 && Array.isArray(evBody.queued) && evBody.queued.length === 3, 'evolve returns 200 + 3 queued', `got ${res.statusCode}`)
   ok(evBody.orchestrator === 'main-agent-spawns-subagents', 'evolve reports main-agent orchestrator', `got ${evBody.orchestrator}`)
@@ -626,7 +690,7 @@ console.log('\n[7] /evolve main agent: spawns ONE main agent that opens subagent
   }
   fs.writeFileSync(ledgerPath7, JSON.stringify(mkLedger()), 'utf8') // reset suggestions to pending
   const res2 = fakeRes()
-  await handlers['/api/skill-evolution/evolve'](fakeReq('POST', { skills: ['sev-a', 'sev-b', 'sev-c'] }), res2)
+  await handlers['/api/skill-evolution/evolve'](fakeReq('POST', { skills: ['sev-a', 'sev-b', 'sev-c'], evolutionMode: 'legacy' }), res2)
   await pollUntil(['sev-a, sev-b, sev-c'])
   ok(agentCreates === 1, 'second run also spawns exactly one main agent', `agentCreates=${agentCreates}`)
   ok(/at most 1 subagent/i.test(lastMainPrompt), 'main prompt reflects updated cap (at most 1)', '')
@@ -838,6 +902,384 @@ console.log('\n[9] /api/skill-evolution/run dispatches to the real pipeline (LLM
     await handlers9['/api/skill-evolution/run'](fakeReq9('POST', { op: 'bogus' }), res)
     ok(res.statusCode === 400, 'run rejects unknown op with 400', `got ${res.statusCode}`)
   }
+}
+
+// ---- 10. skill_evolution_score freezes the rubric; before is reused verbatim ----
+// The user's fairness gate: score the CURRENT live SKILL.md first, then pass that
+// baseline into backtest/write so before and after share one frozen rubric. A
+// baseline whose casesHash or baseHash drifted must be rejected, never recomputed
+// silently (that would reintroduce the distortion the gate is meant to prevent).
+console.log('\n[10] skill_evolution_score freezes a baseline; before reuse + drift rejection')
+{
+  const entry = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest10=' + Date.now())
+  const cap10 = {}
+  const handlers10 = {}
+  const fakeLlm = {
+    async *stream() {
+      yield { type: 'text-delta', text: JSON.stringify([{ id: 'k1', pass: true, reason: 'rubric frozen' }]) }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const fakeCtx10 = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap10[s.name] = s } }, effect: (fn) => fn() })
+      if (deps[0] === 'webServer') return cb({ webServer: { register(arg) { handlers10[arg.path] = arg.handler; return () => {} } } })
+      return cb({ agents: undefined, agentDefaultModel: { currentSelection: () => null }, sessions: { flush() {} }, llm: fakeLlm })
+    },
+  }
+  const r10 = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-score-'))
+  const skillsRoot10 = path.join(r10, 'skills')
+  const skillDir10 = path.join(skillsRoot10, 'score-skill')
+  fs.mkdirSync(skillDir10, { recursive: true })
+  const skillFile10 = path.join(skillDir10, 'SKILL.md')
+  fs.writeFileSync(skillFile10, 'CURRENT BODY\n', 'utf8')
+  const ledgerPath10 = path.join(r10, 'ledger.json')
+  const evalsPath10 = path.join(r10, 'evals.json')
+  const stateDir10 = path.join(r10, 'state')
+  fs.mkdirSync(stateDir10, { recursive: true })
+  fs.writeFileSync(ledgerPath10, JSON.stringify({
+    generation: 1, suggestions: [{ id: 'sc-sug', skillName: 'score-skill', action: 'update', status: 'pending' }], drafts: [],
+  }, null, 2), 'utf8')
+  fs.writeFileSync(evalsPath10, JSON.stringify({ cases: [], runs: [] }, null, 2), 'utf8')
+  entry.apply(fakeCtx10, {
+    ledgerPath: ledgerPath10, evalsPath: evalsPath10, skillsRoot: skillsRoot10,
+    stateDir: stateDir10, allowWrite: true, backupKeep: 5, model: { provider: 'p', model: 'm' },
+    gradeEngine: 'auto',
+  })
+
+  ok(Boolean(cap10['skill_evolution_score']), 'skill_evolution_score tool is registered')
+  ok(Boolean(cap10['skill_evolution_backtest']) && Boolean(cap10['skill_evolution_write']), 'backtest + write tools registered')
+
+  const scoreCases = [{ id: 'c1', title: 't', checks: [{ id: 'k1', text: 'c', must: true, anchors: ['CURRENT'] }] }]
+  const callScore = async () => JSON.parse(await cap10['skill_evolution_score'].execute({ skillName: 'score-skill', cases: scoreCases }))
+  const callBacktest = async (args) => JSON.parse(await cap10['skill_evolution_backtest'].execute({
+    skillName: 'score-skill', draftContent: 'IMPROVED BODY\n', cases: scoreCases, ...args,
+  }))
+
+  // (a) score returns a self-contained baseline with both hashes.
+  const scored = await callScore()
+  ok(scored && scored.baseHash && scored.casesHash, 'score returns baseHash + casesHash')
+  ok(Boolean(scored.baseline && scored.baseline.casesHash === scored.casesHash), 'score baseline carries the same casesHash')
+  ok(typeof scored.score === 'number' && scored.caseRows && scored.caseRows.length === 1, 'score returns a numeric score + caseRows', JSON.stringify(scored).slice(0, 160))
+
+  // (b) before is reused verbatim, beforeReused flagged true, score equal.
+  const reused = await callBacktest({ before: scored.baseline })
+  ok(reused.beforeReused === true, 'backtest beforeReused=true when baseline supplied')
+  ok(reused.before.score === scored.score, 'reused before score equals the frozen baseline score', `${reused.before.score} vs ${scored.score}`)
+  ok(reused.baseHash === scored.baseHash, 'backtest echoes the same baseHash')
+
+  // (c) NEGATIVE: frozen cases changed -> baseline rejected, never recomputed.
+  let driftMsg = ''
+  try {
+    await callBacktest({ before: scored.baseline, cases: [{ id: 'c1', title: 't', checks: [{ id: 'k1', text: 'CHANGED', must: true }] }] })
+  } catch (e) { driftMsg = String((e && e.message) || e) }
+  ok(driftMsg.includes('评测标准变更') || driftMsg.includes('casesHash'), 'backtest rejects a casesHash-drifted baseline', `got "${driftMsg}"`)
+
+  // (d) NEGATIVE: live file changed -> baseHash drift rejected.
+  fs.writeFileSync(skillFile10, 'CURRENT BODY EDITED\n', 'utf8')
+  let hashMsg = ''
+  try {
+    await callBacktest({ before: scored.baseline })
+  } catch (e) { hashMsg = String((e && e.message) || e) }
+  ok(hashMsg.includes('SKILL.md 变更') || hashMsg.includes('baseHash'), 'backtest rejects a baseHash-drifted baseline', `got "${hashMsg}"`)
+
+  // (e) write reuses the frozen baseline and lands a ready draft.
+  fs.writeFileSync(skillFile10, 'CURRENT BODY\n', 'utf8')
+  const scCases = [{
+    id: 'c1', title: 't',
+    checks: [{ id: 'k1', text: 'c1', must: true, anchors: ['CURRENT'] }, { id: 'k2', text: 'c2', must: true, anchors: ['CURRENT'] }, { id: 'k3', text: 'c3', must: true }, { id: 'k4', text: 'c4', must: true }, { id: 'k5', text: 'c5', must: true }, { id: 'k6', text: 'c6', must: true }],
+  }]
+  const scored2 = JSON.parse(await cap10['skill_evolution_score'].execute({ skillName: 'score-skill', cases: scCases }))
+  const written = JSON.parse(await cap10['skill_evolution_write'].execute({
+    skillName: 'score-skill', suggestionId: 'sc-sug', action: 'update', draftContent: '---\nname: score-skill\ndescription: score gate\n---\n\n# score-skill\n\nCURRENT BODY\n',
+    notes: 'before-reuse gate', cases: scCases, before: scored2.baseline,
+  }))
+  ok(written && written.dryRun === false && written.beforeScore === scored2.score, 'write reuses frozen before score (landed draft)', JSON.stringify(written).slice(0, 200))
+
+  // (f) /run route dispatches op=score to the same pipeline.
+  {
+    const res = (() => { const o = { statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(b) { this.bodyStr = b ? b.toString('utf8') : '' } }; return o })()
+    const buf = Buffer.from(JSON.stringify({ op: 'score', skillName: 'score-skill', cases: scCases }))
+    await handlers10['/api/skill-evolution/run']({ method: 'POST', on(ev, cb) { if (ev === 'data') cb(buf); else if (ev === 'end') cb() } }, res)
+    const body = JSON.parse(res.bodyStr)
+    ok(body.ok === true && body.result && body.result.baseline, 'run op=score returns a baseline', JSON.stringify(body).slice(0, 160))
+  }
+}
+
+// ---- 11. runtime concurrency is user-selectable (1..16); 1 = serial, >1 = concurrent ----
+// The user keeps BOTH modes: 1 = OLD serial mode, >1 = NEW concurrent mode. The
+// number is chosen at trigger time via the request body (maxConcurrency, or the
+// concurrency alias), falling back to the panel config. The resolved value must
+// reach the spawned main agent (it carries the soft cap in its prompt) and be
+// reported back to the panel. Out-of-range values must 400.
+console.log('\\n[11] /evolve runtime concurrency: user-selectable 1..16, serial vs concurrent')
+{
+  const entry = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest11=' + Date.now())
+  const cap11 = {}
+  const handlers11 = {}
+  let lastMainPrompt11 = ''
+  const delay11 = (ms) => new Promise((r) => setTimeout(r, ms))
+  const fakeAgents11 = {
+    async create(opts) {
+      const agent = { session: { id: opts.sessionId }, _p: '' }
+      agent.followup = async ({ content }) => { agent._p = (content && content[0] && content[0].text) || '' }
+      agent.whenIdle = async () => { lastMainPrompt11 = agent._p }
+      return { agent }
+    },
+  }
+  const fakeCtx11 = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap11[s.name] = s } }, effect: (fn) => fn() })
+      if (deps[0] === 'webServer') return cb({ webServer: { register(arg) { handlers11[arg.path] = arg.handler; return () => {} } } })
+      return cb({ agents: fakeAgents11, agentDefaultModel: { currentSelection: () => null }, sessions: { flush() {} }, llm: undefined })
+    },
+  }
+  const r11 = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-conc-'))
+  const skillsRoot11 = path.join(r11, 'skills')
+  for (const s of ['conc-a', 'conc-b']) { const d = path.join(skillsRoot11, s); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'SKILL.md'), 'body\\n', 'utf8') }
+  fs.writeFileSync(path.join(r11, 'ledger.json'), JSON.stringify({
+    generation: 1, suggestions: ['conc-a', 'conc-b'].map((n) => ({ id: 'sug-' + n, skillName: n, action: 'update', status: 'pending' })), drafts: [],
+  }), 'utf8')
+  fs.writeFileSync(path.join(r11, 'evals.json'), JSON.stringify({ cases: [], runs: [] }), 'utf8')
+  fs.mkdirSync(path.join(r11, 'state'), { recursive: true })
+  entry.apply(fakeCtx11, {
+    ledgerPath: path.join(r11, 'ledger.json'), evalsPath: path.join(r11, 'evals.json'),
+    skillsRoot: skillsRoot11, stateDir: path.join(r11, 'state'), allowWrite: true, backupKeep: 5,
+    model: { provider: 'p', model: 'm' }, maxConcurrency: 2,
+  })
+  const fakeReq11 = (bodyObj) => { const buf = Buffer.from(JSON.stringify(bodyObj || {})); return { method: 'POST', on(ev, cb) { if (ev === 'data') cb(buf); else if (ev === 'end') cb() } } }
+  const fakeRes11 = () => ({ statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(b) { this.bodyStr = b ? b.toString('utf8') : '' } })
+  const evolve11 = async (bodyObj) => {
+    const res = fakeRes11()
+    await handlers11['/api/skill-evolution/evolve'](fakeReq11(bodyObj), res)
+    return { status: res.statusCode, body: res.bodyStr ? JSON.parse(res.bodyStr) : null }
+  }
+
+  // (a) default: no body field -> falls back to panel config (2); mode=concurrent.
+  lastMainPrompt11 = ''
+  const a = await evolve11({ skills: ['conc-a', 'conc-b'], evolutionMode: 'legacy' })
+  await delay11(80)
+  ok(a.status === 200 && a.body.maxConcurrency === 2 && a.body.mode === 'concurrent', 'default concurrency falls back to config (2, concurrent)', JSON.stringify(a.body).slice(0, 160))
+  ok(/at most 2 subagents/.test(lastMainPrompt11), 'main agent prompt carries resolved concurrency=2', `prompt has: ${/at most \d+ subagents/.test(lastMainPrompt11)}`)
+
+  // (b) maxConcurrency=1 -> OLD serial mode.
+  const b = await evolve11({ skills: ['conc-a'], maxConcurrency: 1, evolutionMode: 'legacy' })
+  ok(b.status === 200 && b.body.maxConcurrency === 1 && b.body.mode === 'serial', 'maxConcurrency=1 reports serial mode', JSON.stringify(b.body).slice(0, 160))
+
+  // (c) concurrency alias (4) is honored.
+  lastMainPrompt11 = ''
+  const c = await evolve11({ skills: ['conc-a'], concurrency: 4, evolutionMode: 'legacy' })
+  await delay11(80)
+  ok(c.status === 200 && c.body.maxConcurrency === 4 && c.body.mode === 'concurrent', 'concurrency alias=4 honored', JSON.stringify(c.body).slice(0, 160))
+  ok(/at most 4 subagents/.test(lastMainPrompt11), 'main agent prompt carries resolved concurrency=4')
+
+  // (d) NEGATIVE: out-of-range (>16) -> 400.
+  const d = await evolve11({ skills: ['conc-a'], maxConcurrency: 99, evolutionMode: 'legacy' })
+  ok(d.status === 400, 'maxConcurrency=99 rejected with 400', `got ${d.status}`)
+
+  // (e) NEGATIVE: non-finite -> 400.
+  const e = await evolve11({ skills: ['conc-a'], maxConcurrency: 'x', evolutionMode: 'legacy' })
+  ok(e.status === 400, 'non-numeric maxConcurrency rejected with 400', `got ${e.status}`)
+}
+
+// ---- SECTION 12: /evolve mode dispatch (v1.16.0): new=code state machine, legacy=LLM main agent ----
+console.log('\\n[12] /evolve evolutionMode: new (code state machine) vs legacy (LLM main agent)')
+{
+  const entry = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest12=' + Date.now())
+  const cap12 = {}
+  const handlers12 = {}
+  let lastMainPrompt12 = ''
+  const delay12 = (ms) => new Promise((r) => setTimeout(r, ms))
+  const fakeAgents12 = {
+    async create(opts) {
+      const agent = { session: { id: opts.sessionId }, _p: '' }
+      agent.followup = async ({ content }) => { agent._p = (content && content[0] && content[0].text) || '' }
+      agent.whenIdle = async () => { lastMainPrompt12 = agent._p }
+      return { agent }
+    },
+  }
+  // llm is deliberately ABSENT here so the new-mode dependency gate is testable.
+  const fakeCtx12 = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap12[s.name] = s } }, effect: (fn) => fn() })
+      if (deps[0] === 'webServer') return cb({ webServer: { register(arg) { handlers12[arg.path] = arg.handler; return () => {} } } })
+      return cb({ agents: fakeAgents12, agentDefaultModel: { currentSelection: () => null }, sessions: { flush() {} }, llm: undefined })
+    },
+  }
+  const r12 = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-mode-'))
+  const skillsRoot12 = path.join(r12, 'skills')
+  for (const s of ['mode-a', 'mode-b']) { const d = path.join(skillsRoot12, s); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'SKILL.md'), 'body\\n', 'utf8') }
+  fs.writeFileSync(path.join(r12, 'ledger.json'), JSON.stringify({
+    generation: 1, suggestions: ['mode-a', 'mode-b'].map((n) => ({ id: 'sug-' + n, skillName: n, action: 'update', status: 'pending' })), drafts: [],
+  }), 'utf8')
+  fs.writeFileSync(path.join(r12, 'evals.json'), JSON.stringify({ cases: [], runs: [] }), 'utf8')
+  fs.mkdirSync(path.join(r12, 'state'), { recursive: true })
+  entry.apply(fakeCtx12, {
+    ledgerPath: path.join(r12, 'ledger.json'), evalsPath: path.join(r12, 'evals.json'),
+    skillsRoot: skillsRoot12, stateDir: path.join(r12, 'state'), allowWrite: true, backupKeep: 5,
+    model: { provider: 'p', model: 'm' }, maxConcurrency: 2, evolutionMode: 'new',
+  })
+  const fakeReq12 = (bodyObj) => { const buf = Buffer.from(JSON.stringify(bodyObj || {})); return { method: 'POST', on(ev, cb) { if (ev === 'data') cb(buf); else if (ev === 'end') cb() } } }
+  const fakeRes12 = () => ({ statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(b) { this.bodyStr = b ? b.toString('utf8') : '' } })
+  const evolve12 = async (bodyObj) => {
+    const req = fakeReq12(bodyObj); const res = fakeRes12()
+    await handlers12['/api/skill-evolution/evolve'](req, res)
+    return { status: res.statusCode, body: JSON.parse(res.bodyStr || '{}') }
+  }
+  ok(typeof handlers12['/api/skill-evolution/evolve'] === 'function', 'evolve12 handler registered')
+
+  // (a) default mode = new = CODE state machine. It needs ONLY the host llm;
+  // with llm absent it must answer 503 rather than spawn an LLM main agent.
+  const a12 = await evolve12({ skills: ['mode-a'] })
+  ok(a12.status === 503 && /llm/i.test(a12.body.error || ''), 'new mode without host llm -> 503 (code state machine dependency gate)', `got ${a12.status} err=${a12.body.error}`)
+  ok(!/main-agent/.test(a12.body.error || ''), 'new mode 503 does NOT blame the agents service', a12.body.error)
+
+  // (b) legacy = the ORIGINAL LLM main-agent orchestrator, kept verbatim.
+  lastMainPrompt12 = ''
+  const b12 = await evolve12({ skills: ['mode-a'], evolutionMode: 'legacy' })
+  await delay12(80)
+  ok(b12.status === 200 && b12.body.evolutionMode === 'legacy', 'evolutionMode=legacy in response', JSON.stringify(b12.body).slice(0, 160))
+  ok(b12.body.orchestrator === 'main-agent-spawns-subagents', 'legacy reports main-agent orchestrator', `got ${b12.body.orchestrator}`)
+  ok(/LEGACY mode/.test(lastMainPrompt12), 'legacy-mode prompt says LEGACY mode')
+  ok(/you never grade yourself/.test(lastMainPrompt12), 'legacy-mode prompt: main agent does not grade')
+
+  // (c) NEGATIVE: invalid evolutionMode -> 400
+  const c12 = await evolve12({ skills: ['mode-a'], evolutionMode: 'turbo' })
+  ok(c12.status === 400 && /new.*legacy/.test(c12.body.error || ''), 'invalid evolutionMode rejected with 400', `got ${c12.status} err=${c12.body.error}`)
+}
+
+// ---- SECTION 13: v1.17.0 CODE-DRIVEN state machine E2E + hard invariants I1..I10 ----
+// Drives the REAL /evolve route with a fake host llm that authors cases[] +
+// draftContent only. Grading is forced to the deterministic anchor engine so the
+// test never depends on a live model. Asserts the whole point of the refactor:
+// N skills = N logical workers (never 2N), ZERO real agents spawned, HARD
+// concurrency bound, BEFORE frozen once and reused, fixed write->verify->
+// backtest order, final per-draftId verify, and a CODE-generated honest report.
+console.log('\\n[13] /evolve NEW mode: code state machine E2E + invariants')
+{
+  const entry13 = await import(pathToFileURL(path.join(import.meta.dirname, 'index.js')).href + '?selftest13=' + Date.now())
+  const cap13 = {}
+  const handlers13 = {}
+  let agentCreates13 = 0
+  const fakeAgents13 = {
+    async create(opts) {
+      agentCreates13++
+      const agent = { session: { id: opts.sessionId }, _p: '' }
+      agent.followup = async () => {}
+      agent.whenIdle = async () => {}
+      return { agent }
+    },
+  }
+  // One case, 7 checks -> granularityOk (>=6). Every anchor is verbatim in the
+  // draft and absent from the current live body, so after > before under anchors.
+  const anchors13 = ['EVOLVE-A1', 'EVOLVE-B2', 'EVOLVE-C3', 'EVOLVE-D4', 'EVOLVE-E5', 'EVOLVE-F6', 'EVOLVE-G7']
+  const draftContent13 = [
+    '---',
+    'name: sev-improved',
+    'description: deterministic code-state-machine selftest fixture carrying every improvement anchor',
+    '---',
+    '',
+    '# Improved skill',
+    '',
+    ...anchors13.map((a) => `The improved body documents ${a} explicitly.`),
+    '',
+  ].join('\n')
+  const cases13 = [{
+    id: 'case-1', title: 'all improvement points present',
+    checks: anchors13.map((a, i) => ({ id: 'c1k' + (i + 1), text: 'documents ' + a, must: true, anchors: [a] })),
+  }]
+  const artifactJson13 = JSON.stringify({ cases: cases13, draftContent: draftContent13 })
+  const fakeLlm13 = {
+    async *stream(_opts) {
+      const pieces = artifactJson13.match(/.{1,40}/gs) || []
+      for (const p of pieces) yield { type: 'text-delta', index: 0, text: p }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const fakeCtx13 = {
+    logger: { info() {} }, on() {},
+    inject(deps, cb) {
+      if (deps[0] === 'tools') return cb({ tools: { register(s) { cap13[s.name] = s } }, effect: (fn) => fn() })
+      if (deps[0] === 'webServer') return cb({ webServer: { register(arg) { handlers13[arg.path] = arg.handler; return () => {} } } })
+      return cb({ agents: fakeAgents13, agentDefaultModel: { currentSelection: () => null }, sessions: { flush() {} }, llm: fakeLlm13 })
+    },
+  }
+  const r13 = fs.mkdtempSync(path.join(os.tmpdir(), 'seb-selftest-sm-'))
+  const skillsRoot13 = path.join(r13, 'skills')
+  const ledgerPath13 = path.join(r13, 'ledger.json')
+  const evalsPath13 = path.join(r13, 'evals.json')
+  const skills13 = ['sm-a', 'sm-b', 'sm-c']
+  for (const s of skills13) { const d = path.join(skillsRoot13, s); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'SKILL.md'), 'current body: nothing useful\\n', 'utf8') }
+  fs.writeFileSync(ledgerPath13, JSON.stringify({
+    generation: 1, suggestions: skills13.map((n) => ({ id: 'sug-' + n, skillName: n, action: 'update', status: 'pending' })), drafts: [],
+  }), 'utf8')
+  fs.writeFileSync(evalsPath13, JSON.stringify({ cases: [], runs: [] }), 'utf8')
+  fs.mkdirSync(path.join(r13, 'state'), { recursive: true })
+  entry13.apply(fakeCtx13, {
+    ledgerPath: ledgerPath13, evalsPath: evalsPath13, skillsRoot: skillsRoot13,
+    stateDir: path.join(r13, 'state'), allowWrite: true, backupKeep: 5,
+    model: { provider: 'p', model: 'm' }, maxConcurrency: 2, gradeEngine: 'anchor',
+  })
+  const fakeReq13 = (bodyObj, method = 'POST') => { const buf = Buffer.from(JSON.stringify(bodyObj || {})); return { method, on(ev, cb) { if (ev === 'data') cb(buf); else if (ev === 'end') cb() } } }
+  const fakeRes13 = () => ({ statusCode: 0, headers: {}, setHeader(k, v) { this.headers[k] = v }, end(b) { this.bodyStr = b ? b.toString('utf8') : '' } })
+  const delay13 = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  const res13 = fakeRes13()
+  await handlers13['/api/skill-evolution/evolve'](fakeReq13({ skills: skills13 }), res13)
+  const body13 = JSON.parse(res13.bodyStr || '{}')
+  ok(res13.statusCode === 200 && body13.evolutionMode === 'new', 'default evolutionMode=new with host llm present', JSON.stringify(body13).slice(0, 160))
+  ok(body13.orchestrator === 'code-state-machine', 'new mode reports code-state-machine orchestrator', `got ${body13.orchestrator}`)
+  ok(Array.isArray(body13.queued) && body13.queued.length === 3, '3 skills queued', `queued=${JSON.stringify(body13.queued)}`)
+
+  // Poll /jobs until the state machine reaches a terminal phase.
+  let job13 = null
+  for (let i = 0; i < 300; i++) {
+    const r = fakeRes13(); await handlers13['/api/skill-evolution/jobs'](fakeReq13({}, 'GET'), r)
+    const jobs = JSON.parse(r.bodyStr || '{}').jobs || []
+    const j = jobs[0]
+    if (j && ['done', 'failed'].includes(j.phase)) { job13 = j; break }
+    await delay13(20)
+  }
+  ok(Boolean(job13), 'code-state-machine job reached terminal phase', job13 ? `phase=${job13.phase}` : 'timed out')
+  const rep = job13 && job13.report
+
+  // I1: N skills = N logical workers, NOT 2N (the 928f11 "14 subagents" defect).
+  ok(rep && rep.workerCount === 3, 'I1 workerCount=3 (one worker per skill, never 2N)', rep && `workerCount=${rep.workerCount}`)
+  // I2: the code driver spawns ZERO real agents — even though `agents` is injected.
+  ok(agentCreates13 === 0, 'I2 zero real agents spawned in new mode', `agentCreates=${agentCreates13}`)
+  ok(rep && rep.agentCreates === 0, 'I2 report.agentCreates=0 (honest)', rep && `agentCreates=${rep.agentCreates}`)
+  // I3: HARD concurrency bound enforced by the code semaphore.
+  ok(rep && rep.peakConcurrency >= 1 && rep.peakConcurrency <= 2, 'I3 peakConcurrency <= maxConcurrency(2)', rep && `peak=${rep.peakConcurrency}`)
+  // I4: BEFORE frozen exactly once per skill and REUSED (no re-freeze).
+  ok(rep && rep.scoreCalls === 3, 'I4 scoreCalls=3 (frozen once per skill)', rep && `scoreCalls=${rep.scoreCalls}`)
+  ok(rep && rep.beforeReused >= 3, 'I4 frozen before reused by write+backtest', rep && `beforeReused=${rep.beforeReused}`)
+  // I5: fixed deterministic pipeline order executed by code.
+  ok(rep && rep.writeCalls === 3, 'I5 writeCalls=3 (code lands drafts)', rep && `writeCalls=${rep.writeCalls}`)
+  ok(rep && rep.verifyCalls === 3, 'I5 verifyCalls=3 (code self-audits)', rep && `verifyCalls=${rep.verifyCalls}`)
+  ok(rep && rep.backtestCalls === 3, 'I5 backtestCalls=3 (code scores after)', rep && `backtestCalls=${rep.backtestCalls}`)
+  // I6: final independent per-draftId verify across the whole batch.
+  ok(rep && rep.finalVerifyCalls === 3, 'I6 finalVerifyCalls=3 (one per landed draft)', rep && `finalVerifyCalls=${rep.finalVerifyCalls}`)
+  ok(rep && Array.isArray(rep.finalAudit) && rep.finalAudit.length === 3 && rep.finalAudit.every((a) => a.allOk), 'I6 finalAudit allOk for every draft', rep && JSON.stringify(rep.finalAudit))
+  // I7: report generated by CODE so declared mode == actual tool ownership.
+  ok(rep && rep.orchestrator === 'code-state-machine' && rep.nameMatchesReality === true, 'I7 report is code-generated and honest', rep && `orchestrator=${rep.orchestrator} nmr=${rep.nameMatchesReality}`)
+  ok(body13.orchestrator === (rep && rep.orchestrator), 'I7 response orchestrator matches report orchestrator')
+  // I8: every skill landed a valid, verified, score-improving draft.
+  ok(rep && rep.results && rep.results.length === 3 && rep.results.every((x) => x.status === 'ok'), 'I8 all 3 workers ok', rep && JSON.stringify(rep.results.map((x) => [x.skill, x.status, x.reason])))
+  ok(rep && rep.results.every((x) => x.scoreOk && x.verifyAllOk && x.granularityOk), 'I8 scoreOk + verifyAllOk + granularityOk for all', rep && JSON.stringify(rep.results.map((x) => [x.skill, x.scoreOk, x.verifyAllOk, x.granularityOk])))
+  const L13 = JSON.parse(fs.readFileSync(ledgerPath13, 'utf8'))
+  ok(L13.drafts.filter((d) => d.status === 'ready').length === 3, 'I8 3 ready drafts in ledger (none adopted/installed)', `ready=${L13.drafts.filter((d) => d.status === 'ready').length}`)
+  ok(L13.suggestions.every((s) => s.status === 'review'), 'I8 all suggestions flipped to review')
+  // I9: PROCESS AS IT ARRIVES — with cap=2 and 3 skills the pool refilled (peak 2).
+  ok(rep && rep.peakConcurrency === 2, 'I9 as-it-arrives refill kept both slots busy (peak=2)', rep && `peak=${rep.peakConcurrency}`)
+  // I10: per-skill step progress is surfaced through GET /jobs for the inline panel rows.
+  const prog13 = job13 && job13.progress
+  ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => prog13[s]), 'I10 progress has a row for every skill', prog13 && Object.keys(prog13).join(','))
+  ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => prog13[s].status === 'done'), 'I10 every skill progress status=done', prog13 && JSON.stringify(Object.keys(prog13).map((s) => [s, prog13[s].status])))
+  const stepKeys13 = ['drafting', 'repairing', 'scoring', 'landing', 'verifying', 'backtesting', 'auditing']
+  ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => stepKeys13.every((k) => prog13[s].steps[k] && prog13[s].steps[k].status === 'done')), 'I10 all 7 steps done for every skill', prog13 && JSON.stringify(Object.keys(prog13).map((s) => [s, stepKeys13.map((k) => prog13[s].steps[k] && prog13[s].steps[k].status)])))
 }
 
 console.log(`\n${failures === 0 ? 'SELFTEST PASS' : `SELFTEST FAIL (${failures})`}`)

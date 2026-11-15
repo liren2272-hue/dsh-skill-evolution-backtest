@@ -1,5 +1,6 @@
 # dsh-skill-evolution-backtest — packages the deterministic half of the Mnemon
-# skill-evolution pipeline as agent tools.
+# skill-evolution pipeline as agent tools, and (1.16.0+) drives them from a
+# deterministic in-plugin code state machine in `new` mode.
 #
 # WHY THIS EXISTS
 #   The Mnemon memory plugin evolves skills: a background reviewer produces
@@ -52,10 +53,18 @@
         model:
           provider: workbuddy
           model: hy4free
-        # Cap on simultaneously running evolution worker agents when the panel
-        # triggers "进化所选". The host agent service runs them concurrently; this
-        # coordinator-level gate limits how many at once (1..16, default 3).
+        # Cap on simultaneously evolving skills when the panel triggers "进化所选".
+        # In `new` mode (default, 1.16.0) this is a HARD code-level cap enforced by
+        # a semaphore in the plugin state machine; in `legacy` mode it is a soft
+        # cap written into the LLM main-agent prompt. (1..16, default 3.)
         maxConcurrency: 3
+        # Orchestration driver. new = deterministic in-plugin code state machine
+        # (host llm authors cases[]/draftContent only, no LLM main agent spawned);
+        # legacy = one 'standard' main agent opening <=maxConcurrency subagents.
+        evolutionMode: new
+        # Per-draft-generation LLM timeout in ms for `new` mode (cases + improved
+        # SKILL.md). Kept separate from judgeTimeoutMs (per-check grading timeout).
+        draftTimeoutMs: 300000
         # The note stamped on every check row. Kept in config so the grading
         # semantics stay auditable from the patch file. The score is host-aligned:
         # a model judges each check semantically, anchors are the offline
