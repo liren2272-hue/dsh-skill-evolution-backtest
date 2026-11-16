@@ -15,7 +15,7 @@ Mnemon 记忆插件会进化技能：后台 review 产出 `suggestions`（「这
 
 > 背景：1.15.0 及以前的 `new` 模式把编排全交给一个 LLM 主代理，靠软提示词约束「并发 ≤ N」「先派发再评分」「子代理只写草案」等。实测（会话 928f11，7 个技能一起进化）证明 LLM 会忽略这些软约束：自行造出第二波 7 个落地子代理（共 14 个）、Write 波与落地波脱节空转约 24 分钟、总耗时 92 分钟，并在收尾报告里把 A 形态说成 C 形态（名实不符）。1.16.0 把**编排本身**从 LLM 提示词里拿走，改成插件代码里的确定性状态机。
 
-**`new`（默认）= 全自动代码状态机**：`POST /evolve` 不再拉起任何 LLM 主代理。宿主 `llm` 服务只为每个技能产出一份 `{"cases":[...],"draftContent":"..."}`（评测 rubric + 改进版完整 SKILL.md 正文），其余全部由代码按固定顺序执行：
+**`new`（默认）= 全自动代码状态机**：`POST /evolve` 不再拉起任何 LLM 主代理。宿主 `llm` 服务只为每个技能跑**两次小调用**（1.18.0）：call1 产出 `{"cases":[...]}`（评测 rubric），call2 产出改进版完整 SKILL.md 正文。拆成两次短流是因为部分上游模型会把「一整份 rubric + 全文」的单次大 JSON 用 `aborted` 截断，其余全部由代码按固定顺序执行：
 
 1. **一技能一 worker**：N 个技能 = N 个逻辑 worker（不是 2N）。草案生成失败最多在**落地前**修复 2 次，绝不带着坏草案落账本。
 2. **并发硬上限**：代码信号量（`stats.active < maxConcurrency`），不是写进提示词的软上限；任一 worker 完成 `.finally` 先补位再干别的（PROCESS AS IT ARRIVES）。
@@ -23,7 +23,7 @@ Mnemon 记忆插件会进化技能：后台 review 产出 `suggestions`（「这
 4. **确定性落地管道**：每个草案固定走 `writeImpl`（带冻结 `before`）→ 逐 `draftId` `verifyImpl` 自审 → `backtestImpl`（带冻结 `before`）算 after；共享账本写入加互斥锁，防并发丢更新。
 5. **收口复核 + 代码生成报告**：全部完成后代码再逐 `draftId` 跑一次 `verifyImpl`，并生成 `report`（`orchestrator:'code-state-machine'`、`agentCreates=0`、`workerCount`、`peakConcurrency`、各类调用计数、`nameMatchesReality`），名实相符、不依赖 LLM 自述。
 
-依赖宿主 `llm` 服务（`llm.stream`）；缺失时 `/evolve` 返回 503。新增配置 `draftTimeoutMs`（默认 300000）控制单次 cases/草案生成的 LLM 超时，与判分用的 `judgeTimeoutMs` 分开。
+依赖宿主 `llm` 服务（`llm.stream`）；缺失时 `/evolve` 返回 503。新增配置 `draftTimeoutMs`（默认 300000）控制**每次** cases/草案生成的 LLM 超时（两次调用各享一个超时），与判分用的 `judgeTimeoutMs` 分开。
 
 **`legacy`（保留）= 旧 LLM 主代理编排**：仍拉起一个 `standard` 主代理、按软上限开子代理、逐草案审核/重试一次，行为与改造前一致；并发数很大、主代理判分成为瓶颈时可选它。下文「主代理降级与体积守卫」「子代理工具挂载」等历史章节**只适用于 legacy**。
 
@@ -214,7 +214,7 @@ node selftest.mjs
 
 离线跑，不碰真实 `~/.mnemon` 存储：在临时目录造假账本，验证部分分数学、casesHash 签名、run/draft 记录形状、pruneDrafts（ready 恒保留）、原子写+generation+1+建议翻 review、并发守卫、verify 全不变量。
 
-`[9]` 专门验证**服务端桥接路由** `/api/skill-evolution/run`：注入假 `llm.stream`，确认 `op:'backtest'` 真的走到 LLM 语义判定（`result.after.engine === 'llm'`，而非锚点回退），`op:'write'` 落 draft、`op:'verify'` 全不变量通过、未知 op 返 400——即 harness 脚本经 HTTP 调用时，评分链路与 agent 工具完全同源。`[10]` 验证**公平闸门**：`skill_evolution_score` 冻结 baseline（带 `baseHash`+`casesHash`+caseRows）、backtest/write 原样复用 `before`（`beforeReused=true`、分数逐字相等）、casesHash 漂移与 baseHash 漂移两种负向对照均被拒绝、`op:'score'` 经路由可达。`[12]` 验证 `/evolve` 按 `evolutionMode` 分叉（`new` 缺宿主 `llm` → 503、`legacy` → 拉起主代理 `main-agent-spawns-subagents`、非法 mode → 400）；`[13]` 用假 `llm.stream` 跑通 `new` 代码状态机的 I1–I10 不变量（worker 数=技能数、agentCreates=0、并发 ≤ 上限、score 一次冻结复用、write/verify/backtest 固定顺序、收尾逐 draftId 复核、代码生成 report 名实相符、全部落 `ready` 草案、as-it-arrives 补位、I10 逐技能逐步 progress 全 done）。
+`[9]` 专门验证**服务端桥接路由** `/api/skill-evolution/run`：注入假 `llm.stream`，确认 `op:'backtest'` 真的走到 LLM 语义判定（`result.after.engine === 'llm'`，而非锚点回退），`op:'write'` 落 draft、`op:'verify'` 全不变量通过、未知 op 返 400——即 harness 脚本经 HTTP 调用时，评分链路与 agent 工具完全同源。`[10]` 验证**公平闸门**：`skill_evolution_score` 冻结 baseline（带 `baseHash`+`casesHash`+caseRows）、backtest/write 原样复用 `before`（`beforeReused=true`、分数逐字相等）、casesHash 漂移与 baseHash 漂移两种负向对照均被拒绝、`op:'score'` 经路由可达。`[12]` 验证 `/evolve` 按 `evolutionMode` 分叉（`new` 缺宿主 `llm` → 503、`legacy` → 拉起主代理 `main-agent-spawns-subagents`、非法 mode → 400）；`[13]` 用假 `llm.stream` 跑通 `new` 代码状态机的 I1–I10 不变量（worker 数=技能数、agentCreates=0、并发 ≤ 上限、score 一次冻结复用、write/verify/backtest 固定顺序、收尾逐 draftId 复核、代码生成 report 名实相符、全部落 `ready` 草案、as-it-arrives 补位、I10 逐技能逐步 progress 全 done）、`[14]` J1–J10（v1.18.0：A1 rubric/draft 两次小调用各一次、B 无 live 文件技能按 create 落地并在面板标警示）、[15] K1–K6（v1.18.1：DRAFT frontmatter 由代码合成保证合法）。v1.18.2：诊断回测在 baseline 漂移（baseHash/casesHash）时不再静默吞错，回退用同一 rubric 重评当前正文、记录 `beforeFallback`，after 分照常返回（面板回测步骤可见分数，不再出现「无回测结果」）。`[10]` 的负向对照仍证明 **write 侧公平闸门**照常拒绝漂移 baseline。v1.19.0：**进化面板 v2 UI**——进度条重设计为分段彩色横条（未完成灰段、失败段红色标出，新增「从失败处重试」）、顶部概览条（模型/进化模式/并发/技能进度/总用时/回测健康）+并行多技能卡片；新增两个面板端点：`GET /api/skill-evolution/draft?id=` 只读取草案正文供「查看草案」弹窗（不采纳/不安装），`POST /api/skill-evolution/rescore` 用与流水线同源的 `scoreImpl`+`backtestImpl` 重算 before/after 并镜像回内存 job（「无回测」卡片一键重算评分）。`[16]` 验证两端点的注册、取草案、400/404/405 负向、重算数值与 rubric 解析。v1.19.1：**面板四连修复**——①回测状态：`resultFor` 改为跨全部 job 的 report 搜索结果，避免最新 retry job 尚未产出结果时丢分、导致「进化过的技能仍显示无回测」；②各段用时：后端 `setStep` 记录每步 `startAt`（active 打点、done/failed 保留），前端 `segTime` 改算单步 `startAt→at` 真实耗时，不再被收尾 finalize 统一覆写时间戳而显示每段不足 1 秒；③小面板彩色链条：折叠态主表格行内新增 7 段彩色迷你链（`seb2-minichain`，复用 SEG_COLORS）；④深色模式按钮：默认/ghost 按钮改用 `label-primary` 字色 + 可见边框并补 `body[data-ds-dark-theme]` 深色覆盖，解决深色下按钮看不清。v1.19.2：**评分回传技能管理面板 + 视觉三修**——①根因修复：Mnemon 的 `SkillsService.saveEvals` 按 skillName 只保留数组前 20 条 run，而插件 write 时 `push` 到数组尾，新 run 在 Mnemon 下次保存时被裁掉，导致 ledger 草案 `runIds` 悬空、技能管理面板「进化」tab 一直显示「还没有回测」；插件改为 `unshift(afterRun, beforeRun)`（candidate 在前，与 Mnemon `startRun` 同序），新 run 落在数组头部故不被裁剪。②前端分段条/迷你链改用内联 `backgroundColor` 直填（原先经 React style 注入的 `var(--c)` 未生效，深色下 7 段全灰），done/active 着色、pending 保持灰段。③彩色迷你链从技能名同行移到名称下方独立换行（`display:flex` + `margin-top`），不再压住名称。④深色模式对比度：`body[data-ds-dark-theme]` 下 hint.ok/run/fail、badge.done/run/fail、meta、score、primary/danger 按钮改为低饱和深底浅字，消除刺眼浅绿与看不清的按钮。v1.19.3：**面板精简 + 任务取消**——①删概览条的「回测健康」（信息量低、常态显示缺失）；②删主表格的「一次性」与「基线」两列，原位改放 7 段彩色进度颗粒（从技能名同行移到独立「进度」列，表格由 8 列缩为 7 列）；③新增任务取消：后端新路由 `POST /api/skill-evolution/cancel` 标记 `cancelRequested`，代码状态机在下一个调度周期不再派新 worker、已启动的 in-flight 任务跑完后才停（避免半写草案），未启动的技能标为 canceled；前端并行区每个运行中任务加「取消」按钮。`[17]` 验证 `/cancel` 路由注册与 405/400/404 负向。
 
 客户端面板另有离线验收（会话内脚本，不进插件目录）：假 React 渲染冒烟测试（无宿主验证无运行时错误 + 统计 checkbox/table/select/style/button + i18n zh/en key 对齐全扁平 + 可见文案无 raw key，含「进化所选」按钮与类型徽章）；宿主四个 HTTP 端点离线干跑（假 webServer 直调 handler：GET state 对真实账本只读返回、POST config 落盘模型+勾选、POST evolve 假 agents 服务拉起任务+模型优先级+无勾选 400/无服务 503、GET jobs 列任务，负向 400/405、disposer 数组已收集）。样式令牌全部对 app.asar 抽出的 475 个真实 `--dsw-*` token 做差集清零（防深色崩）。
 
@@ -225,3 +225,102 @@ node selftest.mjs
 - 破坏性写有备份可回滚（`<stateDir>/backups/<时间戳>/`）。
 - 设置面板在 GUI 里**展示状态 + 配置 + 触发**：勾选技能、选模型，点「进化所选」触发 `new` 代码状态机（LLM 只产出 cases+草案）或 `legacy` 拉起 agent 会话跑进化（创造性改写仍归 LLM/agent）。面板本身不写账本、不采纳；两种模式都只把成果落成 `ready` 草案，绝不采纳/安装/覆盖正式 SKILL.md。
 - 「进化所选」`new` 模式依赖宿主 `llm` 服务、`legacy` 模式依赖 `agents`/`agentDefaultModel`/`sessions` 服务，缺失时该端点返回 503 而非误动作；任务跑在本进程内存里，宿主重启会丢进度记录（成稿已落账本的 `ready` 草案不受影响）。
+
+### v2.0.1 — 修「冻结评分 / 回测瞬发 0.0s」（评审用错模型）
+
+- **根因**：`gradeFor` 硬编码用 config 默认模型（`CFG.model`，默认 `workbuddy/hy4free`）去做语义评审，而不是 job 实际选中的模型。当面板选的模型与默认模型不同、或默认模型不可达时，评审 LLM 调用秒败失败 → `judgeCase` 静默回退到 anchor 正则（毫秒级）→ score / backtest 两段就读成 0.0s。rubric / draft / review 没这问题，因为它们直接拿到了 job 选中的 `llmModel`。
+- **修法**：把 job 选中的模型一路穿进 `gradeFor` → `scoreImpl` / `backtestImpl` / `writeImpl`，评审和起草 rubric / 写草案用**同一个可达模型**。现在 score / backtest 会真正调 LLM 逐 check 语义判定、耗时如实反映（段详情带 `[engine]` 后缀，区分 `llm` / `anchor` / 缓存命中）。
+
+### v2.0.0 — 公平性重构：撰写与审查彻底分离 + 七段重命名
+
+- **公平闸门闭环（修「让写草案 LLM 看检查项=作弊」）**：拆出三个独立环节——`authorRubric` 只产评测标准（cases）、`writeDraft` 只写改进草案（**绝不喂 cases/anchors**，照检查项凑的漏洞已堵）、`reviewDraftInMemory` 由独立审查员（可看 rubric=裁判，作者不可看）在**草案落定前**门控。撰写与审查彻底分离，写草案环节再也无法抄标准。
+- **审查前置 + 打回重写**：草案在落地前先过独立审查（最多 3 次重写预算），审查员打回的 issues 作为修复提示回流，而不是把整份 rubric 裸塞给作者。审查在落地**之前**，不再是落地后的事后追认。
+- **七段进度链重命名**：`dispatch → rubric → score → draft → landing → backtest → verify`。评分（冻结 before 基线）移到草案之前，明确「先定标准 → 冻结基线 → 写草案（含审查）→ 落地 → 回测 → 自审」。落地失败该技能链断在 landing 标红、job 整体不断、beforeCache 复用、账本原子写不坏。
+- **每段重试预算显到面板**：每段最多 3 次重试，重试计数写进步骤详情（`· retried Nx`）供面板红字渲染。
+- **自审加体积守卫**：`verifyImpl` 新增 `sizeOk`（草案 ≤65536 字节），并入历史 12 项检查一起判定。
+- **A+ 落地失败自动重跑**：自审失败时（如 run 对在落地和 verify 之间被宿主 keep-20 剪掉）自动按预算重新落地——复用同一份已过审草案内容与冻结基线（**不重评分、不重审**），新 run 对 `unshift` 到队首活过剪枝，再重新 verify。确定性失败（体积/粒度/分数自洽）重跑同样失败、按预算收敛，如实标记。
+
+### v2.0.2 — 修「评审遗漏体积门 + 面板五个体验问题」
+
+- **审查前置体积门（m07170 + m07205）**：起草→审查→重写循环里，`reviewDraftInMemory` 现在会先测草案字节数，超 65536 字节就打回要求**就地压缩到 64KB 以下**（把压缩指令作为 repairHint 返回给起草方重写）。不再等到最后 verify 才报「体积过大」那时只能崩链。`DRAFT_REVIEW_SYSTEM` 也加了「超大就打回」一条。
+- **单技能计时冻结（m07140 Q1）**：展开卡「总用时」不再用整个 job 的时钟（其他技能还在跑时会一直涨），改用本技能自己的 dispatch→末段时间，技能一完成就冻结。
+- **回测失败不再显绿勾（m07140 Q3）**：回测段失败时该段直接标红✕（不翻转整个技能为失败，因 landing+verify 已成功）；finalize 不再把已 failed 的段洗成绿 done。
+- **「重新回测」按钮（m07155 Q2）**：当唯一失败段是回测（草案已落地+自审过）时，显示「↻ 重新回测」按钮直达 `/rescore`（真重评 before+after），不再是没意义的整技能重跑；`/rescore` 也传 job 选中的模型保证同一可达评审。
+- **落地/自审耗时说明（m07140 Q4/Q5）**：落地里的 `writeImpl` 会对评分算一次真 LLM 语义评审（v2.0.1 修前用错模型秒败→秒回，修后真评审所以变长）；verify 纯读账本+\u54c8\u5e0c比对无 LLM，本就该瞬发。
+
+### v1.19.4 — 动态时钟 + 默认不勾选 + 活动色块
+
+- 总用时与各段计时动态实时跳动：运行中每秒重渲染一次（`now` state），不再只靠 3s 轮询刷新
+- 打开面板默认全不勾选：不再回填上次持久化的选中技能
+- 展开窗口活动色块可见：修正 `.seb2-flow` 用 `var(--c)` 被宿主 sanitizer 剥掉导致不显色，改为内联真实段色
+
+### v1.19.5 — 评分对比并入 meta 行 + 精简 meta 项
+
+- 回测评分对比不再单开一块，并入上方 meta 行（本次模型 / 总用时）末尾
+- 删除 meta 行的待处理 / 待审 / 一次性 / 基线 MISSING 四项
+- 「重新评分」按钮移到卡片底部操作区（仅在有草案但缺评分时显示）
+
+### v1.19.6 — meta 行统一边框 + 取消按钮显示技能数
+
+### v1.19.7 — 概览条取消均分 + 进行中段计时每秒跳动
+
+### v1.28.0
+
+- Top rows made flexible on a single line: overview cells share the row (flex:1 1 0) and truncate with ellipsis; expanded meta row forced to nowrap with shrinkable cells and a tighter score number/arrow/delta so the before->after->delta chip no longer clips off the card edge.
+
+### v1.27.0
+
+- Overview header strip forced onto a single line: the model cell shrinks (font steps down 12/11/10px by name length) with ellipsis safety net, so long model names no longer wrap the strip to a second line.
+
+### v1.26.0
+
+- **调度段真实计时**：`dispatch` 段原先从状态机建 progress 行才开始计时，而进化路由在派发前已花时间加载配置、解析模型、逐技能扫描建议——`pump()` 又几乎立即拉起 worker，导致调度段恒显 0.0s。现于路由入口盖 `acceptedAt` 戳，经 `spawnStateMachine` 传入作为 `job.startedAt` 与 dispatch 段 `startAt`，调度段如实反映排队等待。
+- **评分类 cell 不再换行**：`.seb2-score` 去掉 `flex-wrap:wrap`、`.seb2-sctitle`/`.seb2-sc` 收窄 `min-width`，before→after→delta 单行排布。
+- **回测出分即显**：单技能回测一完成（`pNow2.afterScore` 落 progress）立即在面板渲染真实 before→after→delta，无需等整批收尾。
+- `[17]` 每段耗时语义=该段自身 `startAt→at`（等宽分段不变），瞬发段如实显 0.0s。
+
+### v1.25.0
+
+- **七段进度链：新增「调度」段**。进化面板现在显示 `dispatch → drafting → repairing → scoring → landing → verifying → backtesting` 七段。新增的「调度」段 = 从 job 启动（技能入队）到它的 worker 真正开始跑的排队等待时间，补齐了之前藏进总用时里、不落任何段的“主代理分配任务”时间。收尾复核保持并入「自审」（verifying），不单独占格。
+- **评分/回测标注评测引擎**。scoring / backtesting 的完成详情现在带 `[engine]` 后缀（如 `model` / `anchor` / 缓存复用），区分“真模型判定（较慢）”与“降级正则 / 缓存命中（瞬发）”，避免 0.0s 被误读成“没跑”。
+- 面板等宽彩色链同步为 7 段；selftest I10 与 smoke 断言同步为 7 段。
+
+### v1.24.0
+
+- 修时间轴失效：`setStep` 不再把上一段的开始时间强行继给「从未 active 直接 done」的段（如「修复草案」未触发重生时），改为给它自己的时间戳→时长准确读作 0.0s，不再重复显示上一段时长、也不再「卡在第一段然后瞬间完成」。
+
+### v1.23.0
+
+- 回测 before 基线一冻结就实时上面板：评分阶段一完成，展开栏就显示「before → 待回测」，不再等整个任务跑完。
+- 展开栏 meta 行去掉「框中套框」：三个信息单元合成一块面板，用分隔线分隔，评分数值放大提层级。
+
+### v1.22.0
+
+- 收尾复核（auditing）不再单独占一个彩色段：段数 7→6。
+- 整批级 final 重读仍作为安全网保留，但其结果并进第 5 段「自校验 verifying」（不一致时 verifying 变红）。
+
+### v1.21.0
+
+- 完成时间戳移到展开栏第一行（技能名旁），不再放在折叠表行。
+- 该技能已有更新的待处理建议时，用红色「又有新的更新任务」注明代替时间戳。
+
+### v1.20.0
+
+- 删掉技能名后的「无 live 文件」⚠ 徽标（用户不需要）。
+- 技能名后改为显示完成时间戳：该技能最新一次进化作业结束后（完成/取消/失败），在名称末尾显示 月/日 时:分。
+
+### v1.19.9
+
+- 修复进化面板技能列表与记忆插件不对齐：前端之前会丢掉还没装到磁盘的「新建」类待进化技能，导致 16 个待进化技能只显示 9 个。现在列出后端返回的全部待进化技能（含尚未安装的新建类），无实体文件的技能仍以行内⚠ 标记提醒。
+
+### v1.19.8 — 概览条去竖线 + 刷新重同步任务 + 清除陈旧七色链
+- 概览条去掉四根竖向分隔线（`.seb2-ov` 去 `border-right`），项目仅靠间距区分。
+- 「刷新」按钮现在同时重读技能库（`/state`）与任务列表（`/jobs`），不再只刷一半。
+- 折叠行的七色迷你链只在该技能有进行中任务时才显示；已完成/已取消的旧任务不再留下陈旧链，新需求技能不会误显旧进度。
+- 展开行进行中段计时改为整秒（不带小数），该段结束定格后才显示精确到 0.1s 的小数。
+- 概览条五项不再等宽均分（`.seb2-ov` 由 `flex:1` 改按内容宽），项间加 gap 28px；技能进度值 `white-space:nowrap` 不再换行成两行。
+- 展开行各段计时 active 优先级修正：`segTime` 先判进行中段，用 `now` 每秒重算 `startAt→now`，不再被进入时刻 `at` 走首分支冻结成 0.0s（起草等段现在真实跳动）。
+
+- meta 行的本次模型 / 总用时 / 评分对比统一加边框，对齐整齐
+- 删掉进展段上方无意义的「60%」标签
+- 取消按钮改为显示技能个数（原本截断前 40 字符导致只显示 2/3 个技能名）

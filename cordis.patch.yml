@@ -59,11 +59,12 @@
         # cap written into the LLM main-agent prompt. (1..16, default 3.)
         maxConcurrency: 3
         # Orchestration driver. new = deterministic in-plugin code state machine
-        # (host llm authors cases[]/draftContent only, no LLM main agent spawned);
+        # (1.18.0: host llm runs TWO small calls per skill - rubric {"cases":[...]} then
+        # the improved SKILL.md text - no LLM main agent spawned);
         # legacy = one 'standard' main agent opening <=maxConcurrency subagents.
         evolutionMode: new
-        # Per-draft-generation LLM timeout in ms for `new` mode (cases + improved
-        # SKILL.md). Kept separate from judgeTimeoutMs (per-check grading timeout).
+        # Per-call LLM timeout in ms for `new` mode (1.18.0: each of the two calls -
+        # rubric and draft - gets its own timeout). Kept separate from judgeTimeoutMs (per-check grading timeout).
         draftTimeoutMs: 300000
         # The note stamped on every check row. Kept in config so the grading
         # semantics stay auditable from the patch file. The score is host-aligned:

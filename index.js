@@ -86,10 +86,15 @@ const liveFileHash = (file) => (fs.existsSync(file) ? sha256Hex(fs.readFileSync(
 // with the deterministic anchor grader as the safe fallback; `anchor` forces the
 // offline regex grader. Returns the host-aligned aggregate (case-level score +
 // must-weighted verdicts).
-async function gradeFor(body, cases) {
+async function gradeFor(body, cases, modelOverride) {
   const engine = CFG.gradeEngine === 'anchor' ? GRADE_ENGINE.ANCHOR : CFG.gradeEngine
   const signal = engine === GRADE_ENGINE.ANCHOR ? undefined : AbortSignal.timeout(CFG.judgeTimeoutMs)
-  return judgeBody(body, cases, { llm: SVC.llm, model: CFG.model, signal, engine })
+  // Judge with the model the calling job selected (same one that authored the
+  // rubric/draft) so the semantic judge is actually reachable. Falling back to the
+  // config default here made score/backtest fail fast to the anchor regex and read
+  // 0.0s whenever the selected model differed from CFG.model (m07102).
+  const judgeModel = modelOverride || CFG.model
+  return judgeBody(body, cases, { llm: SVC.llm, model: judgeModel, signal, engine })
 }
 
 // Validate & normalize a PRE-COMPUTED baseline (the frozen "before"). This is the
@@ -187,16 +192,30 @@ async function backtestImpl(args) {
   const current = readBody(skillFile)
   const currentNorm = current === null ? '' : current.replace(/\r\n/g, '\n')
   const baseHash = liveFileHash(skillFile) ?? EMPTY_SHA
-  // Reuse a frozen baseline when the caller supplied one (skill_evolution_score
-  // output); otherwise grade the current body now. The ?? RHS only runs when no
-  // baseline was frozen, so a supplied baseline is never silently recomputed.
-  const before = normalizeBefore(args?.before, cases, baseHash) ?? (await gradeFor(currentNorm, cases))
-  const after = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases)
+  // v1.18.2: Reuse a frozen baseline when the caller supplied one (skill_evolution_score
+  // output); otherwise grade the current body now. A baseline that drifted (the
+  // live file or the rubric changed after it was frozen) is REJECTED by
+  // normalizeBefore. For the DIAGNOSTIC backtest that rejection must not erase the
+  // after score: fall back to grading the current body under the SAME rubric and
+  // record why, so the panel still shows a result instead of silently dropping the
+  // backtest (m02504: skills showed "no backtest result" because this throw was
+  // swallowed upstream and afterScore came back undefined).
+  let before = null
+  let beforeFallback = null
+  try {
+    before = normalizeBefore(args?.before, cases, baseHash)
+  } catch (e) {
+    beforeFallback = String((e && e.message) || e)
+    before = await gradeFor(currentNorm, cases, args?.model)
+  }
+  if (!before) before = await gradeFor(currentNorm, cases, args?.model)
+  const after = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases, args?.model)
   return {
     skillName,
     skillFileExists: current !== null,
     baseHash,
-    beforeReused: Boolean(args?.before),
+    beforeReused: Boolean(args?.before) && !beforeFallback,
+    beforeFallback,
     before: { score: before.score, passRate: before.passRate, totalChecks: before.totalChecks, passedChecks: before.passedChecks, caseRows: before.caseRows },
     after: { score: after.score, passRate: after.passRate, totalChecks: after.totalChecks, passedChecks: after.passedChecks, caseRows: after.caseRows },
     delta: Number((after.score - before.score).toFixed(4)),
@@ -224,7 +243,7 @@ async function scoreImpl(args) {
   const current = readBody(skillFile)
   const baseHash = liveFileHash(skillFile) ?? EMPTY_SHA
   const currentNorm = current === null ? '' : current.replace(/\r\n/g, '\n')
-  const graded = await gradeFor(currentNorm, cases)
+  const graded = await gradeFor(currentNorm, cases, args?.model)
   const baseline = {
     skillName,
     baseHash,
@@ -414,8 +433,8 @@ async function writeImpl(args) {
   // casesHash was computed over the caller's rubric object, BEFORE this function
   // enriches the copies with skillName/id/etc. Enriching first would change the
   // hash and falsely reject an unchanged rubric.
-  const beforeGraded = normalizeBefore(args?.before, rawCases, baseHash) ?? (await gradeFor(current === null ? '' : current.replace(/\r\n/g, '\n'), cases))
-  const afterGraded = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases)
+  const beforeGraded = normalizeBefore(args?.before, rawCases, baseHash) ?? (await gradeFor(current === null ? '' : current.replace(/\r\n/g, '\n'), cases, args?.model))
+  const afterGraded = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases, args?.model)
 
   const beforeRun = buildRun({
     id: randomUUID(), skillName, kind: 'current', hash: baseHash, draftId: null,
@@ -435,7 +454,7 @@ async function writeImpl(args) {
   draft.origin = { path: skillFile }
 
   evals.runs = evals.runs || []
-  evals.runs.push(beforeRun, afterRun)
+  evals.runs.unshift(afterRun, beforeRun)
 
   ledger.drafts = ledger.drafts || []
   ledger.drafts.push(draft)
@@ -498,6 +517,9 @@ function verifyImpl(args) {
       baseHashMatchesLiveFile: d.baseHash === (liveHash ?? EMPTY_SHA),
       contentIntact: Boolean(d.content && d.content.length > 0),
       runPairPresent: Array.isArray(d.runIds) && d.runIds.length === 2,
+      // m06571/m06761: a SKILL.md that DSH itself would reject for size must be a
+      // hard verify defect. 65536 bytes is the host's documented max.
+      sizeOk: Buffer.byteLength(String(d.content ?? ''), 'utf8') <= 65536,
     }
     const [beforeId, afterId] = d.runIds || []
     const b = (evals.runs || []).find((r) => r.id === beforeId)
@@ -849,16 +871,43 @@ function withWriteLock(fn) {
   return result
 }
 
-// The host LLM is used ONLY for these two creative artifacts. Everything else
-// in the 'new' pipeline is deterministic code.
-const ARTIFACT_SYSTEM = `You are authoring an improved DSH SKILL.md and its evaluation rubric for skill evolution.
+// The host LLM is used ONLY for two SMALL creative artifacts (v1.18.0), fetched
+// in TWO separate short streams. A single stream emitting the whole rubric +
+// full SKILL.md in one JSON object was being cut off by some upstream models
+// (finish reason 'aborted') — splitting keeps each response small.
+const RUBRIC_SYSTEM = `You are the RUBRIC AUTHOR (call 1 of 2) for DSH skill evolution.
 Return ONLY a single JSON object (no prose, no markdown fences) with this exact shape:
-{"cases":[{"id":"case-1","title":"<improvement point>","checks":[{"id":"c1k1","text":"<what must be true in the improved skill>","must":true,"anchors":["<literal substring a good draft must contain>"]}]}],"draftContent":"<full improved SKILL.md>"}
+{"cases":[{"id":"case-1","title":"<improvement point>","checks":[{"id":"c1k1","text":"<what must be true in the improved skill>","must":true,"anchors":["<literal substring a good draft must contain>"]}]}]}
 Rules:
 - Produce 1-2 cases totalling AT LEAST 6 independent checks. Each check encodes one improvement intent from the suggestions; "must" marks load-bearing checks.
 - "anchors" are literal substrings a correct draft must contain (used by the offline regex fallback). Give every check at least one short anchor.
-- "draftContent" MUST be a complete SKILL.md starting with a valid YAML frontmatter block: first line "---", then "name: <kebab-case>", "description: <one line>", then "---", then the body. Keep every still-valid section of the CURRENT skill, integrate ALL listed suggestions, and make sure every anchor above appears verbatim in the body.
-- Do NOT adopt, install, or overwrite any file. Just return the JSON object.`
+- Do NOT adopt, install, or overwrite any file. Return only the rubric JSON object.`
+
+const DRAFT_SYSTEM = `You are the DRAFT AUTHOR for DSH skill evolution.
+You are given a set of improvement suggestions and the CURRENT live skill.
+Return ONLY the full improved SKILL.md text — no JSON wrapper, no prose, no explanation.
+Rules:
+- Start with a valid YAML frontmatter block: first line "---", then "name: <kebab-case>", "description: <one line>", then "---", then the body.
+- Keep every still-valid section of the CURRENT skill and integrate ALL listed suggestions into real, substantive improvements.
+- Write the genuinely best improved skill you can. You are NOT shown any grading rubric, scoring checklist, or anchor list, and you must NOT invent or try to satisfy one — the evaluation is separate and hidden from you.
+- Do NOT adopt, install, or overwrite any file. Return only the SKILL.md text.`
+
+// Independent DRAFT REVIEWER. The reviewer MAY see the rubric (it is the judge),
+// unlike the DRAFT AUTHOR above which must never see it. This keeps the draft
+// honest (authored blind) while still letting a rubric-aware judge gate quality
+// before the draft is landed (user m06631/m06634 fairness requirement).
+const DRAFT_REVIEW_SYSTEM = `You are an independent DRAFT REVIEWER for DSH skill evolution.
+You are given an improved SKILL.md draft, the improvement suggestions it must satisfy, and the grading rubric (cases).
+Return ONLY a single JSON object (no prose, no markdown fences) with this exact shape:
+{"ok":true,"issues":[]}  or  {"ok":false,"issues":["<specific, actionable fix>"]}
+Flag a real defect ONLY when the draft:
+- misses valid YAML frontmatter (first line ---, name + description, closing ---), or
+- is oversized (the final SKILL.md file would exceed the host 65536-byte cap -- reject and tell the author to cut scope), or
+- fails to genuinely and substantively integrate one or more listed suggestions, or
+- has empty / truncated / placeholder content or broken sections, or
+- would not actually work as a DSH skill.
+Do NOT flag stylistic nitpicks or require rubric anchor strings to appear verbatim. Return only the JSON object.`
+
 
 // Tolerant single-JSON-object extractor (mirrors extractChecksJson but for an
 // object). Braces inside JSON strings are ignored via the in-string state.
@@ -917,24 +966,193 @@ function validateArtifacts(a) {
   return null
 }
 
-async function generateArtifacts(skill, suggestions, action, currentBody, model, repairHint) {
+// v1.18.0 (A1): the single stream that emitted the whole rubric + full SKILL.md
+// as one JSON object was being cut off by some upstream models (finish reason
+// 'aborted'). Split it into TWO short streams, each with its own timeout:
+//   call 1 -> small {"cases":[...]} rubric object
+//   call 2 -> the improved SKILL.md text only (no JSON wrapper)
+// Use String.fromCharCode(10) for newlines so this block is immune to the
+// classic double-backslash escaping bug when spliced into index.js.
+const NL = String.fromCharCode(10)
+function stripDraftFence(text) {
+  let s = String(text ?? '').trim()
+  if (!s.startsWith('```')) return s
+  const nl = s.indexOf(NL)
+  if (nl < 0) return s
+  let inner = s.slice(nl + 1)
+  const close = inner.lastIndexOf('```')
+  if (close >= 0) inner = inner.slice(0, close)
+  return inner.trim()
+}
+// v1.18.1: real models often emit the improved SKILL.md with a frontmatter block
+// that has NO closing delimiter (or is otherwise malformed). Instead of trusting
+// the model's frontmatter, we keep only the BODY it wrote and re-synthesize a
+// guaranteed-valid frontmatter in code.
+export function parseFrontmatterLoose(text) {
+  const s = String(text ?? '').replace(/\r\n/g, '\n').trim()
+  if (!s) return { name: undefined, description: undefined, body: '', wellFormed: false }
+  if (!s.startsWith('---')) return { name: undefined, description: undefined, body: s, wellFormed: false }
+  const lines = s.split('\n')
+  let closeIdx = -1
+  for (let j = 1; j < lines.length; j++) {
+    if (lines[j].replace(/\r$/, '') === '---') { closeIdx = j; break }
+  }
+  if (closeIdx !== -1) {
+    let name, description
+    for (let j = 1; j < closeIdx; j++) {
+      const m = lines[j].match(/^(name|description)\s*:\s*(.*)$/)
+      if (m) { if (m[1] === 'name') name = m[2].trim().replace(/^"'|"$/g, ''); else description = m[2].trim().replace(/^"'|"$/g, '') }
+    }
+    const body = lines.slice(closeIdx + 1).join('\n').trim()
+    return { name, description, body, wellFormed: true }
+  }
+  // No closing delimiter: drop the opening one plus consecutive key:value lines.
+  let i = 1
+  while (i < lines.length) {
+    const l = lines[i]
+    if (l.trim() === '') { i++; continue }
+    if (/^[A-Za-z0-9_-]+\s*:/.test(l)) { i++; continue }
+    break
+  }
+  let name2, description2
+  for (let j = 1; j < i; j++) {
+    const m = lines[j].match(/^(name|description)\s*:\s*(.*)$/)
+    if (m) { if (m[1] === 'name') name2 = m[2].trim().replace(/^"'|"$/g, ''); else description2 = m[2].trim().replace(/^"'|"$/g, '') }
+  }
+  return { name: name2, description: description2, body: lines.slice(i).join('\n').trim(), wellFormed: false }
+}
+
+const KEBAB_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+// YAML-safe double-quoted scalar: escape backslashes and double quotes so a
+// description carrying colons / quotes can never break parseYaml.
+function yamlSafe(v) {
+  return '"' + String(v ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ') + '"'
+}
+export function repairDraftFrontmatter(text, currentBody, skillName) {
+  const parsed = parseFrontmatterLoose(text)
+  const live = parseFrontmatterLoose(currentBody)
+  const name = (skillName && KEBAB_RE.test(skillName)) ? skillName : (live.name && KEBAB_RE.test(live.name) ? live.name : (parsed.name && KEBAB_RE.test(parsed.name) ? parsed.name : 'improved-skill'))
+  const description = parsed.description || live.description || 'Improved skill draft.'
+  const body = parsed.body || '(No body produced by the model.)'
+  return ['---', 'name: ' + yamlSafe(name), 'description: ' + yamlSafe(description), '---', '', body].join('\n') + '\n'
+}
+
+// Per-segment retry budget (v2.0.0): every LLM/landing segment gets up to this many
+// attempts. A segment that exhausts its budget is marked failed; the whole skill
+// chain stops there but the job continues for other skills (m06761).
+const MAX_STEP_ATTEMPTS = 3
+
+function buildSuggestionBlock(suggestions) {
+  return JSON.stringify(
+    suggestions.map((s) => ({ id: s.id, title: s.title, summary: s.summary, rationale: s.rationale, guidance: s.guidance })),
+    null, 2,
+  )
+}
+
+// RUBRIC AUTHOR (v2.0.0). Produces ONLY the hidden grading cases as a small
+// {"cases":[...]} JSON object. It NEVER produces the improved body. This is the
+// half of the old generateArtifacts call 1, kept on its own so it can run
+// CONCURRENTLY with writeDraft and so neither side can see the other's output.
+async function authorRubric(skill, suggestions, action, currentBody, model, repairHint) {
+  const repair = repairHint ? `${NL}REPAIR: your previous rubric was rejected because: ${repairHint}. Return corrected rubric only.` : ''
   const user = [
     `Skill: ${skill}`,
     `Action: ${action}`,
     'Open suggestions to satisfy (integrate ALL of them):',
-    JSON.stringify(suggestions.map((s) => ({ id: s.id, title: s.title, summary: s.summary, rationale: s.rationale, guidance: s.guidance })), null, 2),
+    buildSuggestionBlock(suggestions),
     '',
     'CURRENT live SKILL.md (preserve still-valid content):',
     '<<<SKILL', String(currentBody ?? ''), 'SKILL>>>',
-    repairHint ? `\nREPAIR: your previous output was rejected because: ${repairHint}. Return a corrected JSON object only.` : '',
-    '\nReturn the JSON object now.',
-  ].join('\n')
+    repair,
+    '',
+    'Return the rubric JSON object now.',
+  ].join(NL)
   const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
-  const text = await streamAssistantText(SVC.llm, model, { system: ARTIFACT_SYSTEM, user, signal })
-  const obj = extractJsonObject(text)
-  if (!obj) throw new Error('LLM did not return a parseable JSON object')
-  return normalizeArtifacts(obj)
+  const rubricText = await streamAssistantText(SVC.llm, model, { system: RUBRIC_SYSTEM, user, signal })
+  const obj = extractJsonObject(rubricText)
+  if (!obj || !Array.isArray(obj.cases)) {
+    throw new Error('LLM (rubric call) did not return a parseable {"cases":[...]} object')
+  }
+  return normalizeArtifacts({ cases: obj.cases, draftContent: '' }).cases
 }
+
+// DRAFT AUTHOR (v2.0.0). Writes ONLY the improved SKILL.md text. CRITICAL
+// FAIRNESS: this call NEVER receives the rubric cases/anchors -- the draft is
+// authored blind to the grading checklist so it cannot pander to it (user
+// m06631/m06634). The only cross-talk allowed is a repairHint carried over from
+// the independent REVIEWER (not the rubric itself).
+async function writeDraft(skill, suggestions, action, currentBody, model, repairHint) {
+  const repair = repairHint ? `${NL}REPAIR: an independent reviewer rejected your previous draft because: ${repairHint}. Rewrite the full SKILL.md fixing exactly those points.` : ''
+  const user = [
+    `Skill: ${skill}`,
+    `Action: ${action}`,
+    'Open suggestions to satisfy (integrate ALL of them):',
+    buildSuggestionBlock(suggestions),
+    '',
+    'CURRENT live SKILL.md (preserve still-valid content):',
+    '<<<SKILL', String(currentBody ?? ''), 'SKILL>>>',
+    repair,
+    '',
+    'Return ONLY the full improved SKILL.md text now.',
+  ].join(NL)
+  const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
+  const draftText = await streamAssistantText(SVC.llm, model, { system: DRAFT_SYSTEM, user, signal })
+  const stripped = stripDraftFence(draftText)
+  if (!stripped.trim()) throw new Error('LLM (draft call) returned empty SKILL.md text')
+  // Never trust the model's frontmatter: re-synthesize a valid block in code.
+  return repairDraftFrontmatter(stripped, currentBody, skill)
+}
+
+// INDEPENDENT DRAFT REVIEWER (v2.0.0). Unlike the DRAFT AUTHOR above, the
+// reviewer MAY see the rubric -- it is the judge, and a judge that cannot see
+// the rubric would be useless. It reviews the in-memory draft BEFORE landing and
+// returns { ok, issues[] }. A failed parse or LLM error is treated as ok=true
+// (a broken reviewer must never block landing) but the reason is surfaced in
+// detail so the panel shows the review ran degraded.
+async function reviewDraftInMemory(skill, draftContent, cases, suggestions, model) {
+  // v2.0.2 SIZE GATE (m07170 + m07205): the reviewer never checked size, so an
+  // oversized draft (e.g. 70860 B > the host 65536 B cap) sailed through landing
+  // and only failed the post-landing verify -- too late, the chain could only
+  // crash. The user is explicit: this must be caught DURING authoring, inside the
+  // write -> review -> rewrite loop, and the fix is to COMPRESS (keep improving,
+  // just shorter) -- NOT to crash the chain at verify. Reject it HERE so the loop
+  // re-drafts with an explicit compress instruction. Checked before the LLM call:
+  // a size failure is deterministic and needs no model. The returned issue becomes
+  // the repairHint fed to the next writeDraft, so the author is told to shrink.
+  const reviewBytes = Buffer.byteLength(String(draftContent ?? ''), 'utf8')
+  if (reviewBytes > 65536) {
+    return {
+      ok: false,
+      issues: ['OVERSIZE: the draft is ' + reviewBytes + ' bytes, over the host 65536-byte cap. COMPRESS the SKILL.md to under 64KB -- keep every real improvement but cut verbosity, drop repetition, tighten prose and long code blocks. Do not just trim a few lines; produce a substantially shorter, still-complete skill.'],
+    }
+  }
+  const user = [
+    `Skill: ${skill}`,
+    'IMPROVEMENT SUGGESTIONS the draft must satisfy:',
+    buildSuggestionBlock(suggestions),
+    '',
+    'GRADING RUBRIC (cases) the draft will be scored against:',
+    JSON.stringify(cases, null, 2),
+    '',
+    'IMPROVED SKILL.md DRAFT to review:',
+    '<<<DRAFT', String(draftContent ?? ''), 'DRAFT>>>',
+    '',
+    'Return the review JSON object now.',
+  ].join(NL)
+  try {
+    const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
+    const reviewText = await streamAssistantText(SVC.llm, model, { system: DRAFT_REVIEW_SYSTEM, user, signal })
+    const obj = extractJsonObject(reviewText)
+    if (!obj || typeof obj.ok !== 'boolean') {
+      return { ok: true, issues: [], degraded: 'reviewer returned unparseable JSON (treated as pass)' }
+    }
+    const issues = Array.isArray(obj.issues) ? obj.issues.map((i) => String(i)).slice(0, 5) : []
+    return { ok: obj.ok || issues.length === 0, issues }
+  } catch (e) {
+    return { ok: true, issues: [], degraded: String((e && e.message) || e) }
+  }
+}
+
 
 // ONE logical worker per skill. Frozen BEFORE is graded exactly once (scoreImpl)
 // and passed unchanged to writeImpl AND backtestImpl (no re-freeze). Retry (once)
@@ -944,7 +1162,13 @@ async function generateArtifacts(skill, suggestions, action, currentBody, model,
 // Per-skill step progress, surfaced to the panel through GET /jobs. publicJob
 // keeps `progress` in `...rest`, so no serialization change is needed.
 // A step is { status:'pending'|'active'|'done'|'failed', at, detail }.
-const STEP_ORDER = ['drafting', 'repairing', 'scoring', 'landing', 'verifying', 'backtesting', 'auditing']
+// v2.0.0 segment order. rubric (author the hidden grading cases) and draft
+// (write the improved body) run CONCURRENTLY and neither sees the other's output
+// (fairness). score freezes the before baseline from the rubric. The draft segment
+// internally runs write -> review -> rewrite (max 3) fully BEFORE landing, so a
+// reviewed, rubric-aware-judged draft is what gets landed. verify (incl. size + all
+// historical checks) is the final self-audit AFTER landing.
+const STEP_ORDER = ['dispatch', 'rubric', 'score', 'draft', 'landing', 'backtest', 'verify']
 function setStep(job, skill, step, status, detail) {
   if (!job || !skill) return
   if (!job.progress) job.progress = {}
@@ -952,7 +1176,15 @@ function setStep(job, skill, step, status, detail) {
   p.current = step
   if (status === 'active') p.status = 'running'
   else if (status === 'failed') { p.status = 'failed'; p.error = String(detail || '') }
-  p.steps[step] = { status, at: new Date().toISOString(), detail: String(detail || '') }
+  const prev = p.steps[step] || {}
+  // startAt: for 'active' it's now; for a terminal status inherit the step's own
+  // startAt ONLY if it ever went active. A step that jumps straight to done/failed
+  // (e.g. repairing "not needed", or a batch fallback) must NOT inherit the prior
+  // step's startAt — that made the time axis show the previous stage's duration
+  // again (m06022: "stuck on stage 1 then suddenly completes"). Give it its own
+  // timestamp so its duration reads 0.0s (accurate for instant code steps).
+  const nowIso = new Date().toISOString()
+  p.steps[step] = { status, at: nowIso, startAt: status === 'active' ? nowIso : (prev.startAt || nowIso), detail: String(detail || '') }
 }
 
 // One logical worker per skill. It authors cases[] + draftContent via the host
@@ -961,87 +1193,248 @@ function setStep(job, skill, step, status, detail) {
 // backtestImpl (score after). The frozen `before` is cached by casesHash and
 // passed unchanged to writeImpl AND backtestImpl (no re-freeze). Retry (once)
 // only regenerates invalid artifacts, BEFORE any draft is committed.
+// A+ (m07044): re-land a draft that failed its post-landing ledger self-audit.
+// Re-running writeImpl verbatim is refused (writeImpl throws when the suggestion
+// already has a draftId), so clear the stale draft + suggestion.draftId first, then
+// write a FRESH draft with the SAME reviewed content, SAME cases and SAME frozen
+// baseline (no re-score, no re-review). writeImpl unshifts the fresh before/after run
+// pair to the FRONT of evals.runs, so it survives the host keep-20 prune that made the
+// first landing's runs vanish between landing and verify. Deterministic failures
+// (sizeOk / granularityOk / score self-consistency) re-fail identically -- that is
+// honest; the caller's budget bounds the retries.
+async function relandForVerify({ skill, suggestionId, action, draftContent, cases, frozen, model }) {
+  const ledger = readJson(CFG.ledgerPath)
+  const sug = (ledger.suggestions || []).find((s) => s.id === suggestionId)
+  const staleIds = new Set()
+  if (sug && sug.draftId) staleIds.add(sug.draftId)
+  for (const d of ledger.drafts || []) if (d.suggestionId === suggestionId) staleIds.add(d.id)
+  if (staleIds.size) {
+    ledger.drafts = (ledger.drafts || []).filter((d) => !staleIds.has(d.id))
+    if (sug) delete sug.draftId
+    writeJsonAtomic(CFG.ledgerPath, ledger)
+  }
+  return writeImpl({ skillName: skill, suggestionId, action, draftContent, cases, before: frozen, model })
+}
+
 async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
+  // worker picked this skill up -> close its dispatch (queue-wait) segment
+  setStep(job, skill, 'dispatch', 'done', 'worker picked up')
   const suggestions = openSuggestionsForSkill(skill)
   if (!suggestions.length) {
-    setStep(job, skill, 'drafting', 'done', 'no open suggestions — skipped')
+    setStep(job, skill, 'rubric', 'done', 'no open suggestions — skipped')
     return { skill, status: 'skipped', reason: 'no open suggestions' }
   }
-  const action = suggestions.some((s) => s.action === 'create') ? 'create' : 'update'
+  const hasLive = fs.existsSync(CFG.skillFile(skill))
+  const action = hasLive ? 'update' : 'create'
   const currentBody = readBody(CFG.skillFile(skill)) ?? ''
-  let artifacts = null, err = null, attempts = 0
-  setStep(job, skill, 'drafting', 'active', 'LLM authors cases[] + draftContent')
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    attempts = attempt
-    try {
-      const a = await generateArtifacts(skill, suggestions, action, currentBody, llmModel, err)
-      err = validateArtifacts(a)
-      if (!err) { artifacts = a; break }
-    } catch (e) { err = String((e && e.message) || e) }
-    if (attempt < 2 && err) setStep(job, skill, 'repairing', 'active', `invalid artifacts: ${err}`)
+
+  // ---- RUBRIC + DRAFT-AUTHORING run CONCURRENTLY (fairness) ----
+  // authorRubric produces ONLY the cases; the draft half starts from the SAME
+  // suggestions but NEVER sees the cases. Neither call can influence the other,
+  // so scoring the current live file against the rubric is not distorted by the
+  // improved body (user m06631/m06634).
+  let rubricCases = null, rubricErr = null, rubricAttempts = 0
+  let draftContent = null, draftErr = null, draftAuthorAttempts = 0
+  setStep(job, skill, 'rubric', 'active', 'LLM authors the hidden grading cases[]')
+  setStep(job, skill, 'draft', 'active', 'LLM writes the improved SKILL.md')
+  const rubricTask = (async () => {
+    let last = null
+    for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+      rubricAttempts = attempt
+      try { return await authorRubric(skill, suggestions, action, currentBody, llmModel, last) }
+      catch (e) { last = String((e && e.message) || e) }
+      setStep(job, skill, 'rubric', 'active', `rubric rejected, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
+    }
+    throw new Error(last || 'rubric generation failed')
+  })()
+  const draftTask = (async () => {
+    let last = null
+    for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+      draftAuthorAttempts = attempt
+      try { return await writeDraft(skill, suggestions, action, currentBody, llmModel, last) }
+      catch (e) { last = String((e && e.message) || e) }
+      setStep(job, skill, 'draft', 'active', `draft authoring failed, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
+    }
+    throw new Error(last || 'draft authoring failed')
+  })()
+  const settled = await Promise.allSettled([rubricTask, draftTask])
+  if (settled[0].status === 'fulfilled') rubricCases = settled[0].value
+  else rubricErr = String((settled[0].reason && settled[0].reason.message) || settled[0].reason)
+  if (settled[1].status === 'fulfilled') draftContent = settled[1].value
+  else draftErr = String((settled[1].reason && settled[1].reason.message) || settled[1].reason)
+  if (rubricErr) {
+    setStep(job, skill, 'rubric', 'failed', `rubric generation failed after ${rubricAttempts} attempts: ${rubricErr}`)
+    return { skill, status: 'failed', reason: `rubric generation failed: ${rubricErr}`, attempts: rubricAttempts, suggestionIds: suggestions.map((s) => s.id) }
   }
-  if (!artifacts) {
-    setStep(job, skill, 'drafting', 'failed', `artifact generation failed after ${attempts} attempts: ${err}`)
-    return { skill, status: 'failed', reason: `artifact generation failed after ${attempts} attempts: ${err}`, attempts, suggestionIds: suggestions.map((s) => s.id) }
+  setStep(job, skill, 'rubric', 'done', `cases ready (${(rubricCases || []).length})${rubricAttempts > 1 ? ` · retried ${rubricAttempts - 1}x` : ''}`)
+  if (draftErr) {
+    // Rubric is still reusable, but without a body there is nothing to land. Report
+    // failure honestly; beforeCache keeps the frozen baseline for a later retry.
+    setStep(job, skill, 'draft', 'failed', `draft authoring failed after ${draftAuthorAttempts} attempts: ${draftErr}`)
+    return { skill, status: 'failed', reason: `draft authoring failed: ${draftErr}`, attempts: draftAuthorAttempts, suggestionIds: suggestions.map((s) => s.id) }
   }
-  setStep(job, skill, 'drafting', 'done', `cases + draft ready (${attempts} attempt(s))`)
-  setStep(job, skill, 'repairing', 'done', attempts > 1 ? 'regenerated invalid artifacts' : 'not needed')
-  const { cases, draftContent } = artifacts
+
+  // ---- SCORE: freeze the before baseline from the rubric (BEFORE any landing) ----
+  const cases = rubricCases
   const key = skill + '|' + casesHash(cases)
   let frozen = beforeCache.get(key)
   const reuseHit = Boolean(frozen)
-  setStep(job, skill, 'scoring', 'active', 'freezing before baseline (skill_evolution_score)')
-  if (!frozen) { stats.scoreCalls++; frozen = await scoreImpl({ skillName: skill, cases }); beforeCache.set(key, frozen) }
-  else stats.beforeCacheHits++
-  setStep(job, skill, 'scoring', 'done', reuseHit ? 'before cache hit / reused' : 'before frozen')
-  // Land one draft per open suggestion (shared content, shared frozen before,
-  // shared rubric). withWriteLock protects the shared ledger from lost updates.
+  setStep(job, skill, 'score', 'active', 'freezing before baseline (skill_evolution_score)')
+  if (!frozen) {
+    stats.scoreCalls++
+    let scoreErr = null
+    for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+      try { frozen = await scoreImpl({ skillName: skill, cases, model: llmModel }); scoreErr = null; break }
+      catch (e) { scoreErr = String((e && e.message) || e) }
+    }
+    if (!frozen) {
+      setStep(job, skill, 'score', 'failed', `scoring failed after ${MAX_STEP_ATTEMPTS} attempts: ${scoreErr}`)
+      return { skill, status: 'failed', reason: `scoring failed: ${scoreErr}`, attempts: MAX_STEP_ATTEMPTS, suggestionIds: suggestions.map((s) => s.id) }
+    }
+    beforeCache.set(key, frozen)
+  } else stats.beforeCacheHits++
+  setStep(job, skill, 'score', 'done', (reuseHit ? 'before cache hit / reused' : 'before frozen') + (frozen && frozen.baseline && frozen.baseline.engine ? ' [' + frozen.baseline.engine + ']' : ''))
+  // Expose the frozen baseline score NOW so the panel shows "before -> (pending)".
+  if (frozen && frozen.baseline && Number.isFinite(frozen.baseline.score)) {
+    const pNow = job.progress && job.progress[skill]
+    if (pNow) pNow.beforeScore = frozen.baseline.score
+  }
+
+  // ---- DRAFT: independent review -> rewrite loop, fully BEFORE landing ----
+  // The reviewer (not the author) may see the rubric. Up to MAX_STEP_ATTEMPTS
+  // total drafts; each rejected draft is rewritten with the reviewer's issues as
+  // the repair hint (never the raw rubric). Exhausting the budget fails the skill.
+  let review = await reviewDraftInMemory(skill, draftContent, cases, suggestions, llmModel)
+  let draftTotalAttempts = draftAuthorAttempts
+  if (!review.ok) setStep(job, skill, 'draft', 'active', `reviewer rejected draft (1/${MAX_STEP_ATTEMPTS}): ${(review.issues || []).slice(0, 2).join('; ')}`)
+  while (!review.ok && draftTotalAttempts < MAX_STEP_ATTEMPTS) {
+    draftTotalAttempts++
+    try {
+      draftContent = await writeDraft(skill, suggestions, action, currentBody, llmModel, (review.issues || []).join(' | '))
+    } catch (e) {
+      setStep(job, skill, 'draft', 'failed', `rewrite failed (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}): ${String((e && e.message) || e)}`)
+      return { skill, status: 'failed', reason: `draft rewrite failed: ${String((e && e.message) || e)}`, attempts: draftTotalAttempts, suggestionIds: suggestions.map((s) => s.id) }
+    }
+    review = await reviewDraftInMemory(skill, draftContent, cases, suggestions, llmModel)
+    if (!review.ok && draftTotalAttempts < MAX_STEP_ATTEMPTS) {
+      setStep(job, skill, 'draft', 'active', `reviewer rejected rewrite ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}: ${(review.issues || []).slice(0, 2).join('; ')}`)
+    }
+  }
+  if (!review.ok) {
+    setStep(job, skill, 'draft', 'failed', `draft failed review after ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS} attempts: ${(review.issues || []).slice(0, 2).join('; ')}`)
+    return { skill, status: 'failed', reason: 'draft failed review', attempts: draftTotalAttempts, reviewIssues: review.issues, suggestionIds: suggestions.map((s) => s.id) }
+  }
+  setStep(job, skill, 'draft', 'done', `draft passed review (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS})${draftTotalAttempts > 1 ? ` · retried ${draftTotalAttempts - 1}x` : ''}`)
+
+  // ---- LANDING: one draft per open suggestion, retried, under the write lock ----
   const draftIds = []
+  const draftSugMap = {}
   let lastError = null
+  let landingAttempts = 0
   setStep(job, skill, 'landing', 'active', `writing ${suggestions.length} ready draft(s) (skill_evolution_write)`)
   for (const s of suggestions) {
-    try {
-      const land = await withWriteLock(() => writeImpl({
-        skillName: skill, suggestionId: s.id, action, draftContent, cases, before: frozen,
-        notes: `code-state-machine v1.17.0 (attempt ${attempts}, ${suggestions.length} suggestion(s))`,
-      }))
-      stats.writeCalls++; stats.beforeReused++
-      draftIds.push(land.draftId)
-    } catch (e) { lastError = String((e && e.message) || e) }
+    let landed = null
+    let sErr = null
+    for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+      landingAttempts++
+      try {
+        landed = await withWriteLock(() => writeImpl({
+          skillName: skill, suggestionId: s.id, action, draftContent, cases, before: frozen, model: llmModel,
+          notes: `code-state-machine v2.0.0 (draft attempt ${draftTotalAttempts}, ${suggestions.length} suggestion(s))`,
+        }))
+        sErr = null
+        break
+      } catch (e) { sErr = String((e && e.message) || e) }
+    }
+    if (landed) { stats.writeCalls++; stats.beforeReused++; draftIds.push(landed.draftId); draftSugMap[landed.draftId] = s.id }
+    else lastError = sErr
   }
   if (!draftIds.length) {
-    setStep(job, skill, 'landing', 'failed', `landing failed: ${lastError}`)
-    return { skill, status: 'failed', reason: `landing failed: ${lastError}`, attempts, suggestionIds: suggestions.map((s) => s.id) }
+    setStep(job, skill, 'landing', 'failed', `landing failed after ${landingAttempts} attempt(s): ${lastError}`)
+    return { skill, status: 'failed', reason: `landing failed: ${lastError}`, attempts: landingAttempts, suggestionIds: suggestions.map((s) => s.id) }
   }
-  setStep(job, skill, 'landing', 'done', `${draftIds.length} draft(s) landed`)
-  // Self-audit EVERY landed draft, then score the after result once per skill.
+  setStep(job, skill, 'landing', 'done', `${draftIds.length} draft(s) landed${landingAttempts > draftIds.length ? ` · retried ${landingAttempts - draftIds.length}x` : ''}`)
+
+  // ---- BACKTEST: score the after result once per skill (diagnostic) ----
+  let bt = null
+  let btError = null
+  setStep(job, skill, 'backtest', 'active', 'scoring the after result (skill_evolution_backtest)')
+  try {
+    bt = await backtestImpl({ skillName: skill, draftContent, cases, before: frozen, model: llmModel })
+    stats.backtestCalls++; stats.beforeReused++
+  } catch (e) {
+    // backtest is diagnostic; record, do not fail the worker. Never swallow
+    // silently — surface WHY there is no after score (m02504).
+    btError = String((e && e.message) || e)
+  }
+  if (bt) {
+    setStep(job, skill, 'backtest', 'done', `after=${bt.after?.score} delta=${bt.delta}${bt.beforeFallback ? ' ⚠before recomputed (baseline drifted)' : ''}${bt.after?.engine ? ' [' + bt.after.engine + ']' : ''}`)
+  } else {
+    // v2.0.2 (m07140 Q3): a failed backtest must NOT read as a green 'done'
+    // segment. Mark THIS segment failed (red X) so the panel is honest, but do NOT
+    // flip the whole skill to failed -- landing + verify already succeeded and
+    // backtest is diagnostic. Write the step directly so setStep's 'failed' branch
+    // (which sets p.status='failed') is bypassed.
+    const nowIso = new Date().toISOString()
+    const pB = job.progress && job.progress[skill]
+    if (pB) pB.steps.backtest = { status: 'failed', at: nowIso, startAt: (pB.steps.backtest && pB.steps.backtest.startAt) || nowIso, detail: `backtest failed: ${btError}` }
+  }
+  if (bt && bt.after && Number.isFinite(bt.after.score)) {
+    const pNow2 = job.progress && job.progress[skill]
+    if (pNow2) { pNow2.afterScore = bt.after.score; pNow2.delta = bt.delta }
+  }
+
+  // ---- VERIFY: FINAL self-audit of every landed draft (size + all history) ----
   const verify = []
-  setStep(job, skill, 'verifying', 'active', `self-verifying ${draftIds.length} draft(s) (skill_evolution_verify)`)
-  for (const draftId of draftIds) {
+  let verifyRetries = 0
+  setStep(job, skill, 'verify', 'active', `self-verifying ${draftIds.length} draft(s) (skill_evolution_verify)`)
+  const verifyOne = (draftId) => {
     const v = verifyImpl({ draftId })
     stats.verifyCalls++
     const r = (v.results && v.results[0]) || {}
-    verify.push({ draftId, allOk: v.allOk, granularityOk: !!(r.checks && r.checks.granularityOk) })
+    return { draftId, allOk: v.allOk, granularityOk: !!(r.checks && r.checks.granularityOk), sizeOk: !!(r.checks && r.checks.sizeOk) }
   }
-  setStep(job, skill, 'verifying', 'done', verify.every((v) => v.allOk) ? 'allOk' : 'some verify checks failed')
-  let bt = null
-  setStep(job, skill, 'backtesting', 'active', 'scoring the after result (skill_evolution_backtest)')
-  try {
-    bt = await backtestImpl({ skillName: skill, draftContent, cases, before: frozen })
-    stats.backtestCalls++; stats.beforeReused++
-  } catch (e) { /* backtest is diagnostic; record, do not fail the worker */ }
-  setStep(job, skill, 'backtesting', 'done', bt ? `after=${bt.after?.score} delta=${bt.delta}` : 'diagnostic backtest failed')
+  for (const draftId of draftIds) verify.push(verifyOne(draftId))
+  // A+ (m07044): a failed ledger self-audit (e.g. its run pair was pruned by the host
+  // keep-20 between landing and verify) is re-landed with the SAME reviewed content +
+  // frozen before (no re-score / no re-review) up to MAX_STEP_ATTEMPTS, then
+  // re-verified. Deterministic content failures re-fail identically and stop at budget.
+  for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS && verify.some((v) => !v.allOk); attempt++) {
+    const failed = verify.filter((v) => !v.allOk)
+    let relanded = 0
+    for (const f of failed) {
+      const suggestionId = draftSugMap[f.draftId]
+      if (!suggestionId) continue
+      setStep(job, skill, 'verify', 'active', `verify failed, re-landing ${String(f.draftId).slice(0, 8)} (attempt ${attempt}/${MAX_STEP_ATTEMPTS})`)
+      try {
+        const again = await withWriteLock(() => relandForVerify({ skill, suggestionId, action, draftContent, cases, frozen, model: llmModel }))
+        if (again && again.draftId) {
+          draftSugMap[again.draftId] = suggestionId
+          const res = verifyOne(again.draftId)
+          const idx = verify.indexOf(f)
+          if (idx >= 0) verify[idx] = res
+          relanded++
+        }
+      } catch (e) { /* re-land refused; keep the original failure honestly */ }
+    }
+    verifyRetries += relanded
+  }
+  setStep(job, skill, 'verify', 'done', (verify.every((v) => v.allOk) ? 'allOk' : 'some verify checks failed') + (verifyRetries > 0 ? ` · re-landed ${verifyRetries}x` : ''))
   const beforeScore = frozen?.baseline?.score
   const afterScore = bt ? bt.after?.score : undefined
   return {
-    skill, status: 'ok', action, attempts,
+    skill, status: 'ok', action, attempts: draftTotalAttempts,
     suggestionIds: suggestions.map((s) => s.id),
     draftIds,
     beforeScore, afterScore, delta: bt ? bt.delta : undefined,
     beforeReused: bt ? bt.beforeReused : false,
+    beforeFallback: bt ? bt.beforeFallback : null,
+    backtestError: btError,
     verifyAllOk: verify.every((v) => v.allOk),
+    verifyRetries,
     granularityOk: verify.every((v) => v.granularityOk),
     scoreOk: afterScore === undefined ? true : Number(afterScore) + 1e-9 >= Number(beforeScore),
+    reviewOk: review.ok,
     verify,
   }
 }
@@ -1064,10 +1457,26 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
   if (!job.progress) job.progress = {}
   for (const s of queue) {
     if (!job.progress[s]) job.progress[s] = { skill: s, status: 'queued', current: 'queued', steps: {}, error: null }
+    // dispatch segment = skill queued -> its worker picks it up. Start the
+    // clock at job.startedAt (the evolve route's accept time), NOT now — the
+    // route already spent real time building this queue before the state
+    // machine began pumping, and that wait belongs to dispatch (m06336).
+    setStep(job, s, 'dispatch', 'active', 'queued — waiting for a worker slot')
+    if (job.startedAt) job.progress[s].steps.dispatch.startAt = job.startedAt
   }
   await new Promise((resolve) => {
     const pump = () => {
+      if (job.cancelRequested) {
+        // USER CANCEL: mark every skill that never started as canceled and stop
+        // dispatching new workers. In-flight workers are allowed to finish so a
+        // half-written draft is never left dangling.
+        while (cursor < queue.length) {
+          const skill = queue[cursor++]
+          results.push({ skill, status: 'canceled', reason: 'canceled by user' })
+        }
+      }
       if (cursor >= queue.length && stats.active === 0) { resolve(); return }
+      if (job.cancelRequested) return // do not dispatch new; drain active then resolve
       while (stats.active < maxConcurrency && cursor < queue.length) {
         const skill = queue[cursor++]
         stats.active++
@@ -1081,24 +1490,23 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
     pump()
   })
   // Final independent re-read across the whole batch, keyed by every draftId.
-  job.phase = 'auditing'
+  // Kept as a safety net, but no longer a standalone `auditing` segment: a
+  // batch-level discrepancy folds into the per-skill `verifying` step.
+  job.phase = 'verifying'
   const finalAudit = []
   for (const r of results) {
-    if (r.status !== 'ok' || !Array.isArray(r.draftIds)) {
-      if (r.skill) setStep(job, r.skill, 'auditing', r.status === 'skipped' ? 'done' : 'failed', r.reason || 'worker did not land a draft')
-      continue
-    }
-    setStep(job, r.skill, 'auditing', 'active', `final verify ${r.draftIds.length} draft(s)`)
+    if (r.status !== 'ok' || !Array.isArray(r.draftIds)) continue
     for (const draftId of r.draftIds) {
       try {
         const v = verifyImpl({ draftId })
         stats.finalVerifyCalls++
         finalAudit.push({ draftId, skill: r.skill, allOk: v.allOk })
+        if (!v.allOk) setStep(job, r.skill, 'verify', 'failed', `final audit mismatch: draft ${draftId}`)
       } catch (e) {
         finalAudit.push({ draftId, skill: r.skill, allOk: false, error: String((e && e.message) || e) })
+        setStep(job, r.skill, 'verify', 'failed', `final audit error: ${draftId}`)
       }
     }
-    setStep(job, r.skill, 'auditing', 'done', 'final per-draftId audit complete')
   }
   // Finalize per-skill progress so the panel's inline rows reach a terminal,
   // fully-populated state (every one of STEP_ORDER marked done/failed).
@@ -1107,16 +1515,18 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
     if (!p) continue
     if (r.status === 'ok') {
       for (const k of STEP_ORDER) {
-        if (!p.steps[k] || p.steps[k].status !== 'done') p.steps[k] = { status: 'done', at: new Date().toISOString(), detail: p.steps[k]?.detail || '' }
+        if (!p.steps[k]) p.steps[k] = { status: 'done', at: new Date().toISOString(), startAt: undefined, detail: '' }
+        else if (p.steps[k].status === 'failed') { /* v2.0.2 (m07140 Q3): keep the honest failure -- do NOT paint a green check over a failed segment (e.g. a diagnostic backtest that errored). */ }
+        else if (p.steps[k].status !== 'done') p.steps[k] = { status: 'done', at: new Date().toISOString(), startAt: p.steps[k]?.startAt, detail: p.steps[k]?.detail || '' }
       }
       p.status = 'done'; p.current = 'done'
     } else {
-      p.status = r.status === 'skipped' ? 'skipped' : 'failed'
+      p.status = r.status === 'skipped' ? 'skipped' : r.status === 'canceled' ? 'canceled' : 'failed'
       p.current = r.status
       p.error = r.reason || null
       for (const k of STEP_ORDER) {
         if (!p.steps[k] || p.steps[k].status === 'active' || p.steps[k].status === 'pending') {
-          p.steps[k] = { status: r.status === 'skipped' ? 'done' : 'failed', at: new Date().toISOString(), detail: r.reason || '' }
+          p.steps[k] = { status: r.status === 'skipped' ? 'done' : 'failed', at: new Date().toISOString(), startAt: p.steps[k]?.startAt, detail: r.reason || '' }
         }
       }
     }
@@ -1149,14 +1559,14 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
     scoreOk: results.every((r) => r.status !== 'ok' || r.scoreOk),
     reason: `${okCount}/${queue.length} landed`,
   }
-  job.status = 'completed'
-  job.phase = 'done'
+  job.status = job.cancelRequested ? 'canceled' : 'completed'
+  job.phase = job.cancelRequested ? 'canceled' : 'done'
   job.finishedAt = new Date().toISOString()
   return report
 }
 
 // Mirror spawnMainAgent's job bookkeeping, but for the code state machine.
-function spawnStateMachine(queue, model, maxConcurrency) {
+function spawnStateMachine(queue, model, maxConcurrency, acceptedAt) {
   const job = {
     jobId: randomUUID(),
     skill: queue.join(', '),
@@ -1164,7 +1574,11 @@ function spawnStateMachine(queue, model, maxConcurrency) {
     sessionId: null,
     model: model || null,
     maxConcurrency,
-    startedAt: new Date().toISOString(),
+    // startedAt = the moment the evolve route accepted the request (NOT when
+    // the state machine starts pumping workers). The route spends real time
+    // building the queue before spawnStateMachine runs; attributing that to
+    // the per-skill dispatch segment requires starting the clock at accept.
+    startedAt: acceptedAt || new Date().toISOString(),
     phase: 'queued',
     status: 'running',
     attempts: 1,
@@ -1279,6 +1693,34 @@ function publicJob(job) {
   return rest
 }
 
+// Locate the rubric cases belonging to a draft (mirrors the v1.18.2 backfill
+// script, read-only). Exact suggestionId match wins; otherwise the most
+// recently updated rubric group for the same skill is used. Deterministic.
+function rubricForDraft(draft, allCases) {
+  const skillName = String((draft && draft.skillName) || '')
+  const mine = (Array.isArray(allCases) ? allCases : []).filter((c) => c && c.skillName === skillName)
+  const sid = draft && draft.suggestionId
+  const exact = mine.filter((c) => c.origin && typeof c.origin === 'object' && c.origin.suggestionId === sid)
+  if (exact.length) return exact
+  const groups = new Map()
+  for (const c of mine) {
+    const o = c.origin
+    const key = (o && typeof o === 'object')
+      ? 'obj:' + (o.suggestionId || o.trajectoryId || 'none')
+      : (typeof o === 'string' ? 'str:' + o : 'none')
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(c)
+  }
+  let best = []
+  let top = ''
+  for (const g of groups.values()) {
+    const t = g.map((c) => c.updatedAt || '').sort().pop() || ''
+    if (t > top) { top = t; best = g }
+  }
+  return best.length ? best : mine
+}
+const safeReadJson = (f) => { try { return readJson(f) || {} } catch { return {} } }
+
 function registerPanelRoutes(ctx) {
   if (typeof ctx.inject !== 'function') return
   // Resolve the host services the evolve spawner needs. If any is missing the
@@ -1344,6 +1786,10 @@ function registerPanelRoutes(ctx) {
     // status=ready for human approval and are fire-and-forget (panel polls /jobs).
     register('/api/skill-evolution/evolve', async (request, response) => {
       if (request.method !== 'POST') { writeJson(response, 405, { error: 'method not allowed' }); return }
+      // acceptedAt = wall clock at route entry. Queue building (config load,
+      // model resolution, per-skill suggestion scan) happens below BEFORE the
+      // state machine starts; the per-skill dispatch segment must include it.
+      const acceptedAt = new Date().toISOString()
       try {
         const body = JSON.parse((await readReqBody(request)).toString('utf8') || '{}')
         const pc = loadPanelConfig()
@@ -1429,7 +1875,7 @@ function registerPanelRoutes(ctx) {
         // subagents, soft cap in its prompt, reviews/retries once). Both are
         // fire-and-forget: the pipeline takes minutes, the panel polls /jobs.
         if (resolvedMode === 'new') {
-          spawnStateMachine(queue, model, resolvedConcurrency)
+          spawnStateMachine(queue, model, resolvedConcurrency, acceptedAt)
         } else {
           spawnMainAgent(queue, model, resolvedConcurrency, resolvedMode).catch((e) => {
             ctx?.logger?.error?.(`skill-evolution-backtest: legacy orchestrator crashed: ${String(e && e.stack || e)}`)
@@ -1472,6 +1918,132 @@ function registerPanelRoutes(ctx) {
         .map(publicJob)
         .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
       writeJson(response, 200, { jobs })
+    })
+
+    // POST { jobId } → request a cooperative cancel of a running evolution job.
+    register('/api/skill-evolution/cancel', async (request, response) => {
+      if (request.method !== 'POST') { writeJson(response, 405, { error: 'method not allowed' }); return }
+      try {
+        const body = JSON.parse((await readReqBody(request)).toString('utf8') || '{}')
+        const jobId = String(body.jobId || '').trim()
+        if (!jobId) { writeJson(response, 400, { error: 'jobId is required' }); return }
+        const job = RUNNING.get(jobId)
+        if (!job) { writeJson(response, 404, { error: 'job not found' }); return }
+        if (job.cancelRequested) { writeJson(response, 200, { ok: true, jobId, cancelRequested: true, already: true }); return }
+        if (job.status !== 'running') { writeJson(response, 409, { error: 'job is not running', status: job.status }); return }
+        job.cancelRequested = true
+        writeJson(response, 200, { ok: true, jobId, cancelRequested: true })
+      } catch (e) {
+        writeJson(response, 500, { error: String((e && e.message) || e) })
+      }
+    })
+
+    // GET ?id=<draftId> → the draft body for the panel's "view draft" modal.
+    // Read-only: never adopts/installs, just returns what writeImpl landed.
+    register('/api/skill-evolution/draft', async (request, response) => {
+      try {
+        if (request.method && String(request.method).toUpperCase() !== 'GET') {
+          writeJson(response, 405, { error: 'method not allowed' }); return
+        }
+        const url = new URL(request.url || '/', 'http://localhost')
+        const id = String(url.searchParams.get('id') || '').trim()
+        if (!id) { writeJson(response, 400, { error: 'id is required' }); return }
+        const ledger = safeReadJson(CFG.ledgerPath)
+        const draft = (Array.isArray(ledger.drafts) ? ledger.drafts : []).find((d) => d && d.id === id)
+        if (!draft) { writeJson(response, 404, { error: 'draft not found' }); return }
+        writeJson(response, 200, { ok: true, draft: {
+          id: draft.id,
+          skillName: draft.skillName,
+          suggestionId: draft.suggestionId,
+          action: draft.action,
+          status: draft.status,
+          baseHash: draft.baseHash,
+          notes: draft.notes,
+          runIds: draft.runIds,
+          createdAt: draft.createdAt,
+          updatedAt: draft.updatedAt,
+          content: String(draft.content || ''),
+        } })
+      } catch (e) { writeJson(response, 500, { error: String(e && e.message || e) }) }
+    })
+
+    // POST { skillName, draftId?, draftContent?, cases?, suggestionId? } →
+    // recompute before/after with the SAME gradeFor path as the pipeline and
+    // mirror the result into the in-memory job report so the panel's "no
+    // backtest" card turns into a scored card on the next poll. Never rewrites
+    // the draft body and never adopts/installs anything.
+    register('/api/skill-evolution/rescore', async (request, response) => {
+      if (request.method !== 'POST') { writeJson(response, 405, { error: 'method not allowed' }); return }
+      try {
+        const body = JSON.parse((await readReqBody(request)).toString('utf8') || '{}')
+        const skillName = String(body.skillName || '').trim()
+        const draftId = String(body.draftId || '').trim()
+        if (!skillName) { writeJson(response, 400, { error: 'skillName is required' }); return }
+        let content = typeof body.draftContent === 'string' ? body.draftContent : null
+        let draft = null
+        if (draftId) {
+          const ledger = safeReadJson(CFG.ledgerPath)
+          draft = (Array.isArray(ledger.drafts) ? ledger.drafts : []).find((d) => d && d.id === draftId) || null
+          if (draft) content = String(draft.content || '')
+        }
+        if (!content) { writeJson(response, 400, { error: 'draftId or draftContent is required' }); return }
+        let cases = Array.isArray(body.cases) && body.cases.length ? body.cases : null
+        if (!cases) {
+          const evals = safeReadJson(CFG.evalsPath)
+          const pseudo = draft || { skillName, suggestionId: body.suggestionId }
+          cases = rubricForDraft(pseudo, evals.cases || [])
+        }
+        if (!cases.length) {
+          writeJson(response, 422, { error: 'no rubric cases found for this skill — cannot rescore' }); return
+        }
+        const pc2 = loadPanelConfig()
+        const rcModel = pc2.model || null
+        const baseline = await scoreImpl({ skillName, cases, model: rcModel })
+        const bt = await backtestImpl({ skillName, draftContent: content, cases, before: baseline.baseline, model: rcModel })
+        // v2.0.2 (m07155 Q2): when the only failed segment is backtest, the panel's
+        // "re-backtest" button lands here. Also flip that segment's step detail from
+        // the red failure to a live "after" reading so the re-backtest is visible on
+        // the next /jobs poll (the job may already be terminal -- best-effort).
+        for (const job of RUNNING.values()) {
+          const pr = job && job.progress && job.progress[skillName]
+          const bs = pr && pr.steps && pr.steps.backtest
+          if (bs && bs.status === 'failed') {
+            bs.status = 'done'
+            bs.at = new Date().toISOString()
+            bs.detail = `after=${bt.after.score} delta=${bt.delta} (re-backtested)`
+          }
+        }
+        const result = {
+          skillName,
+          draftId: draftId || null,
+          beforeScore: bt.before.score,
+          afterScore: bt.after.score,
+          delta: bt.delta,
+          passRate: bt.after.passRate,
+          engine: bt.engine,
+          beforeFallback: bt.beforeFallback || null,
+          casesCount: cases.length,
+          rescoredAt: new Date().toISOString(),
+        }
+        // Mirror into every in-memory job that reports this skill, so the
+        // panel reflects the new score on its next /jobs poll.
+        let mirrored = 0
+        for (const job of RUNNING.values()) {
+          const results = job && job.report && Array.isArray(job.report.results) ? job.report.results : null
+          if (!results) continue
+          for (const r of results) {
+            if (!r || r.skill !== skillName) continue
+            r.beforeScore = result.beforeScore
+            r.afterScore = result.afterScore
+            r.delta = result.delta
+            r.backtestError = null
+            r.scoreOk = true
+            r.rescoredAt = result.rescoredAt
+            mirrored++
+          }
+        }
+        writeJson(response, 200, { ok: true, result: { ...result, mirrored } })
+      } catch (e) { writeJson(response, 500, { error: String(e && e.message || e) }) }
     })
 
     return disposers
