@@ -33,14 +33,11 @@
     - id: skill-evolution-backtest
       name: '@local/dsh-skill-evolution-backtest'
       config:
-        # Where the Mnemon skill-evolution ledgers live. Defaults shown match the
-        # stock desktop layout (~/.mnemon/skills). Override only if yours differs.
-        ledgerPath: 'C:\\Users\\15940\\.mnemon\\skills\\ledger.json'
-        evalsPath: 'C:\\Users\\15940\\.mnemon\\skills\\evals.json'
+        # Where the Mnemon skill-evolution ledgers live. 不覆盖 → 源码默认按
+        # os.homedir() 解析到 ~/.mnemon/skills/（随机器而变），仅在布局不同时才覆盖。
         # Root of the live skills this pipeline improves (each skill is
         # <skillsRoot>/<skillName>/SKILL.md). The baseHash of a draft is the
-        # sha256 of that file's bytes at draft time.
-        skillsRoot: 'C:\\Users\\15940\\.dsh\\skills'
+        # sha256 of that file's bytes at draft time. 不覆盖 → 默认 ~/.dsh/skills。
         # Master switch for the mutating `write` tool. When false, `write`
         # reports what it WOULD do and touches nothing — safe for a dry run.
         allowWrite: true

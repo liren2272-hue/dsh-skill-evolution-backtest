@@ -1284,7 +1284,7 @@ console.log('\\n[13] /evolve NEW mode: code state machine E2E + invariants')
   const prog13 = job13 && job13.progress
   ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => prog13[s]), 'I10 progress has a row for every skill', prog13 && Object.keys(prog13).join(','))
   ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => prog13[s].status === 'done'), 'I10 every skill progress status=done', prog13 && JSON.stringify(Object.keys(prog13).map((s) => [s, prog13[s].status])))
-  const stepKeys13 = ['dispatch', 'rubric', 'score', 'draft', 'landing', 'backtest', 'verify']
+  const stepKeys13 = ['dispatch', 'rubric', 'score', 'draft', 'review', 'landing', 'verify']
   ok(prog13 && ['sm-a', 'sm-b', 'sm-c'].every((s) => stepKeys13.every((k) => prog13[s].steps[k] && prog13[s].steps[k].status === 'done')), 'I10 all 7 steps (v2 segments) done for every skill', prog13 && JSON.stringify(Object.keys(prog13).map((s) => [s, stepKeys13.map((k) => prog13[s].steps[k] && prog13[s].steps[k].status)])))
 }
 
@@ -1636,5 +1636,97 @@ console.log("[17] panel job cancel (POST /cancel)")
   }
 }
 
+// ---- SECTION 18: v2.2.18 score concurrency (not starved behind draft) -------
+console.log('[18] v2.2.18 score runs concurrently with draft (LLM slot not idle)')
+{
+  const src18 = fs.readFileSync(path.join(import.meta.dirname, 'index.js'), 'utf8')
+  ok(!/Promise\.allSettled\(\[rubricTask, draftTask\]\)/.test(src18),
+    'score no longer waits behind a rubric+draft-only allSettled barrier',
+    'still has the two-element barrier')
+  ok(/const scoreTask = rubricTask\.then\(/.test(src18),
+    'scoreTask launches off rubricTask alone (concurrent with draft)',
+    'no rubricTask.then scoreTask')
+  ok(/Promise\.allSettled\(\[rubricTask, draftTask, scoreTask\]\)/.test(src18),
+    'barrier includes scoreTask so its result is awaited before review',
+    'three-way barrier missing')
+}
+
+// ---- SECTION 19: v2.2.19 live-poll liveness + unified segment clock -------
+console.log('[19] v2.2.19 poll from fresh snapshot + continuous segment clock')
+{
+  const csrc19 = fs.readFileSync(path.join(import.meta.dirname, 'lib/client/index.js'), 'utf8')
+  ok(!/jobsRef\.current\.some\(/.test(csrc19),
+    'poll liveness no longer reads a stale one-render-old jobsRef')
+  ok(/setTimeout\(tick, fresh && isRunning\(fresh\) \? 3000 : 5000\)/.test(csrc19),
+    'poll cadence comes from the fresh snapshot and keeps a slow idle poll')
+  ok(!/const priorRun = Number\(cur\.runMs\) \|\| 0/.test(csrc19),
+    'active segment no longer adds runMs (the 76->56 jump source)')
+  ok(/v2\.2\.24: a WAITING segment carries NO clock/.test(csrc19),
+    'v2.2.24 queued/pending segments carry no clock (only status, no seconds)')
+}
+
+// ---- SECTION 20: v2.2.20 score-queue clock + config persistence -------
+console.log('\n[20] score queued placeholder + config memory + /models route')
+{
+  const isrc20 = fs.readFileSync(path.join(import.meta.dirname, 'index.js'), 'utf8')
+  ok(!isrc20.includes("setStep(job, skill, 'score', 'active', 'freezing"), 'score no longer marked active in code')
+  ok(isrc20.includes("setStep(job, skill, 'score', 'queued', 'freezing"), 'score starts as queued placeholder')
+  ok(isrc20.includes('const persisted = loadPanelConfig()'), 'configure backfills CFG from disk')
+  ok(isrc20.includes('maxConcurrency: pc.maxConcurrency,'), 'state reports persisted concurrency')
+  ok(!isrc20.includes('readPanelConfig()'), 'no undefined readPanelConfig call')
+}
+
+// ---- SECTION 21: v2.2.21 seven-color overview chain + merged label -------
+console.log('\n[21] overview chain inline colors + status/time on one line')
+{
+  const csrc21 = fs.readFileSync(path.join(import.meta.dirname, 'lib/client/index.js'), 'utf8')
+  ok(!csrc21.includes("'--c': SEG_COLORS[i]"), 'overview chain no longer relies on sanitizer-stripped var(--c)')
+  ok(csrc21.includes("style: (st === 'done' || st === 'active' || st === 'queued') ? { backgroundColor: SEG_COLORS[i] } : undefined"),
+    'overview pmbar colors all seven segments with inline backgroundColor')
+  ok(csrc21.includes('.exec(rawDur)'), 'merged label parses the numeric duration from segTime')
+  ok(csrc21.includes("t('progress.timeSep')") && csrc21.includes("t('progress.seconds')"),
+    'status and time merged with locale-aware separator and unit')
+  ok(!csrc21.includes("className: 'seb2-labt'"), 'separate time-label node removed')
+  ok((csrc21.match(/'progress\.timeSep':/g) || []).length === 2, 'timeSep defined in both zh and en locales')
+  ok((csrc21.match(/'progress\.seconds':/g) || []).length === 2, 'seconds defined in both zh and en locales')
+}
+
+// ---- SECTION 22: v2.2.23 single-skill bar animations (flow / done tick / fail cross) ----
+console.log('\n[22] single-skill bar animations: active flow + done tick + fail cross')
+{
+  const csrc22 = fs.readFileSync(path.join(import.meta.dirname, 'lib/client/index.js'), 'utf8')
+  // active keeps a light track (no solid inline color) so the sliding flow stays visible
+  ok(csrc22.includes("style: (st === 'done' || st === 'queued') ? { backgroundColor: SEG_COLORS[i] } : undefined }"),
+    'single-skill active segment no longer painted solid')
+  ok(csrc22.includes("@keyframes seb2flow{0%{left:-30%;}100%{left:110%;}}"),
+    'flow keyframes slide the bright bar across the track')
+  ok(csrc22.includes(".seb2-flow{position:absolute;top:0;left:0;height:100%;width:58%;") &&
+     csrc22.includes("animation:seb2flow 2.2s ease-in-out infinite;"),
+    'flow bar has width/position and looping animation')
+  ok(csrc22.includes("className: 'seb2-flow', key: 'f', style: { backgroundColor: SEG_COLORS[i], boxShadow:"),
+    'flow bar keeps full-opacity color plus design glow (no opacity dimming)')
+  // done ✓ tick re-added as a sibling pushed after the seg, above the colored bar
+  ok(csrc22.includes("if (st === 'done') kids.push(React.createElement('span', { className: 'seb2-tick', key: 'k' }, '✓'))"),
+    'done segments render a white ✓ tick')
+  ok(csrc22.includes("pointer-events:none;z-index:1;}"),
+    'tick z-index:1 paints above the colored bar')
+  // fail ✕ stays via CSS ::after
+  ok(csrc22.includes(".seb2-seg.fail::after{content:\"✕\""), 'fail segments keep the white ✕ via CSS')
+  // overview chain paths were NOT changed by the single-skill fix
+  ok((csrc22.match(/style: \(st === 'done' \|\| st === 'active' \|\| st === 'queued'\) \? \{ backgroundColor: SEG_COLORS\[i\] \} : undefined/g) || []).length === 2,
+    'overview mini-chain and pmbar keep their seven-color inline paints')
+}
+
+// ---- SECTION 23: v2.2.24 pure-run segment timing -----------------------
+console.log('\n[23] v2.2.24 queued has no clock + active/done subtract folded wait')
+{
+  const csrc24 = fs.readFileSync(path.join(import.meta.dirname, 'lib/client/index.js'), 'utf8')
+  ok(/cur\.status === 'queued' \|\| cur\.status === 'pending'\) return '—'/.test(csrc24),
+    'queued/pending segments render an em-dash (no seconds)')
+  ok(!csrc24.includes('segWs'), 'old live waitStartAt queue clock is gone')
+  ok(!csrc24.includes('cur.firstStartAt || cur.startAt'), 'old firstStartAt wall-clock origin is gone')
+  ok(csrc24.includes('(endMs - start) - waitMs'), 'run time subtracts folded queue wait (accumMs)')
+  ok(!csrc24.includes('const fmtTime ='), 'unused fmtTime helper removed')
+}
 console.log(`\n${failures === 0 ? 'SELFTEST PASS' : `SELFTEST FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

@@ -17,6 +17,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { resolvePaths } from './lib/paths.mjs'
 import { sha256Hex, EMPTY_SHA, casesHash } from './lib/hash.mjs'
 import { gradeBody, normalizeCases } from './lib/grade.mjs'
@@ -40,7 +41,7 @@ function configure(cfg = {}) {
     stateDir: cfg.stateDir || path.join(process.cwd(), 'state'),
     allowWrite: cfg.allowWrite !== false,
     backupKeep: Number.isFinite(cfg.backupKeep) ? cfg.backupKeep : 20,
-    model: cfg.model || { provider: 'workbuddy', model: 'hy4free' },
+    model: cfg.model || { provider: 'workbuddy', model: 'hy4flash-free' },
     // Concurrency the user can choose (m00533): how many worker subagents may
     // run at once. Clamped 1..16; default 3. 1 = OLD serial mode (one skill at a
     // time); >1 = NEW concurrent mode (several skills in parallel). The user picks
@@ -68,6 +69,18 @@ function configure(cfg = {}) {
   // and path.join treats "/C:" as a relative segment → "C:\C:\...". fileURLToPath
   // converts correctly to "C:\Users\...".
   if (!cfg.stateDir) CFG.stateDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'state')
+  // v2.2.20: configure() rebuilds CFG from defaults on every process start, so
+  // panel settings persisted in panel-config.json were silently ignored until
+  // re-entered (m11226). Restore them here; disk is the source of truth for
+  // user-tuned runtime settings. Fresh stateDirs fall back to CFG values.
+  try {
+    const persisted = loadPanelConfig()
+    if (persisted && typeof persisted === 'object') {
+      if (Number.isFinite(persisted.maxConcurrency)) CFG.maxConcurrency = persisted.maxConcurrency
+      if (persisted.model && typeof persisted.model === 'object') CFG.model = persisted.model
+      if (persisted.evolutionMode === 'legacy' || persisted.evolutionMode === 'new') CFG.evolutionMode = persisted.evolutionMode
+    }
+  } catch {}
   return CFG
 }
 
@@ -86,6 +99,168 @@ const liveFileHash = (file) => (fs.existsSync(file) ? sha256Hex(fs.readFileSync(
 // with the deterministic anchor grader as the safe fallback; `anchor` forces the
 // offline regex grader. Returns the host-aligned aggregate (case-level score +
 // must-weighted verdicts).
+// ---- Global LLM dispatch semaphore (v2.1.0 concurrency rework, m07696) ----
+// maxConcurrency means "how many LLM calls may be in flight at once across the
+// whole job", NOT how many skill workers run in parallel. Every skill worker
+// launches immediately; its LLM calls queue on this single global gate. When a
+// slot frees the next call is chosen by three-tier priority:
+//   1. slots never idle (always fill if anything is waiting),
+//   2. prefer the skill CLOSEST TO DONE (finish-one-first: a finished skill
+//      stops competing for slots entirely),
+//   3. among equally-close skills, backfill the one with the MOST remaining
+//      work (longest-job-first: start heavy work early).
+// Priority context ({skill, job}) rides AsyncLocalStorage, so the gate wraps
+// call sites without threading skill/job through every signature.
+const llmCtx = new AsyncLocalStorage() // carries { skill, job } for gate priority
+// v2.2.7 cooperative-cancel: build the signal for one LLM call = the job's
+// cancel signal (aborted by POST /cancel) merged with the per-call timeout, so
+// clicking Cancel interrupts an in-flight stream instead of waiting out 5 min.
+function jobCallSignal() {
+  const store = llmCtx.getStore() || {}
+  const jobSig = store.job && store.job.abortController ? store.job.abortController.signal : null
+  const to = AbortSignal.timeout(CFG.draftTimeoutMs)
+  return jobSig ? AbortSignal.any([jobSig, to]) : to
+}
+const LLM_GATE = { cap: 3, active: 0, peak: 0, dispatches: 0, queue: [] }
+function llmGateSetCap(n) {
+  LLM_GATE.cap = Math.max(1, Math.min(16, Number.isFinite(n) ? (n | 0) : 3))
+}
+function llmGateDoneCount(job, skill) {
+  const p = job && job.progress && job.progress[skill]
+  if (!p || !p.steps) return 0
+  let done = 0
+  for (const k of STEP_ORDER) {
+    const st = p.steps[k]
+    if (st && (st.status === 'done' || st.status === 'failed')) done++
+  }
+  return done
+}
+// Cumulative LLM queue-wait accounting for the dispatch segment (m07834 B).
+// waitStartAt is stamped when a skill's call BEGINS waiting; accumMs grows by
+// the wait on each grant. Both live on the dispatch step so the panel can show
+// accumMs + (waitStartAt ? now - waitStartAt : 0) -- freeze while holding a
+// slot / doing code work, keep growing while queued again.
+function llmGateWaitBegin(job, skill) {
+  const d = job && job.progress && job.progress[skill] && job.progress[skill].steps && job.progress[skill].steps.dispatch
+  if (!d) return
+  if (d.status === 'done') { if (!d.waitStartAt) d.waitStartAt = new Date().toISOString(); return } // closed dispatch: fold later waits silently
+  if (!d.waitStartAt) d.waitStartAt = new Date().toISOString()
+}
+function llmGateWaitEnd(job, skill) {
+  const d = job && job.progress && job.progress[skill] && job.progress[skill].steps && job.progress[skill].steps.dispatch
+  if (!d || !d.waitStartAt) return
+  const st = Date.parse(d.waitStartAt)
+  d.accumMs = (Number(d.accumMs) || 0) + (Number.isFinite(st) ? Math.max(0, Date.now() - st) : 0)
+  d.waitStartAt = null
+  d.at = new Date().toISOString()
+}
+// Mark a per-call segment queued (waiting on the gate) or active (slot granted).
+// Sets status only (preserves startAt/detail/attempts set by setStep); never
+// resurrects a terminal step. step===null is a no-op (call sites that skip marking).
+function markStepGate(job, skill, step, status) {
+  if (!job || !skill || !step) return
+  const p = job.progress && job.progress[skill]
+  const st = p && p.steps && p.steps[step]
+  if (!st || st.status === 'done' || st.status === 'failed') return
+  const nowIso = new Date().toISOString()
+  // v2.2.8 rewrite-time accounting: remember the FIRST slot-grant so the
+  // segment can show total time across the first run + every rewrite.
+  if (!st.firstStartAt) st.firstStartAt = st.startAt || nowIso
+  if (status === 'active' && st.startAt) {
+    // v2.2.12 re-activation (a rewrite): fold the just-finished RUN into runMs so
+    // its time is not lost, then the clock restarts from the new grant. This must
+    // NOT touch accumMs -- accumMs is queue-wait ONLY, and mixing it here is what
+    // made the panel show a ~10h gate wait as prior RUN time (m10206: 36331s on a
+    // 53s job).
+    const ran = Date.now() - Date.parse(st.startAt)
+    if (Number.isFinite(ran) && ran > 0) st.runMs = (Number(st.runMs) || 0) + ran
+  }
+  // Per-call queue-wait accounting (v2.2.1): stamp the wait when the segment
+  // queues on the global gate, fold it into accumMs once a slot is granted, so
+  // the panel can show a live "queued Ns" instead of a frozen 0.0s.
+  // v2.2.6: do NOT stamp waitStartAt on a generic 'queued' marking. The worker
+  // marks rubric/draft 'queued' at startup as a PRE-GATE PLACEHOLDER -- stamping
+  // here gave both segments a waitStartAt at the same instant, so the client's
+  // queued branch ran two identical queue-wait clocks (m09783/m09799: identical
+  // timelines, clock moving before the call even reaches the gate). The only
+  // legitimate wait stamp is the 'queued' markStepGate inside llmGateAcquire,
+  // which fires when the call actually pushes onto the gate queue.
+  if (status === 'active') {
+    if (!st.startAt) st.startAt = nowIso
+    if (st.waitStartAt) {
+      const wst = Date.parse(st.waitStartAt)
+      st.accumMs = (Number(st.accumMs) || 0) + (Number.isFinite(wst) ? Math.max(0, Date.now() - wst) : 0)
+      st.waitStartAt = null
+    }
+  }
+  if (status === 'queued' && !st.waitStartAt) {
+    // v2.2.13: the call is sitting on the gate queue == waiting for scheduling.
+    // Stamp the step so the client's queued branch live-ticks a scheduling clock
+    // (m10294: a non-finished task must always have a clock moving; no LLM slot
+    // == waiting for dispatch). Folded into accumMs on grant by the 'active'
+    // branch above, never into runMs, so the end-of-run total does not jump.
+    st.waitStartAt = nowIso
+  }
+  st.status = status
+  st.at = nowIso
+}
+// Close the dispatch (scheduling/queue-wait) segment the moment a skill acquires
+// its FIRST LLM slot: queued == waiting for scheduling == stage one, so past that
+// point dispatch goes silent (done) and the per-call segments own the breathing.
+function closeDispatch(job, skill) {
+  const p = job && job.progress && job.progress[skill]
+  const d = p && p.steps && p.steps.dispatch
+  if (!d || d.status === 'done') return
+  llmGateWaitEnd(job, skill)
+  d.status = 'done'
+  d.at = new Date().toISOString()
+}
+function llmGatePump() {
+  while (LLM_GATE.active < LLM_GATE.cap && LLM_GATE.queue.length) {
+    let best = 0
+    for (let i = 1; i < LLM_GATE.queue.length; i++) {
+      const a = LLM_GATE.queue[i]
+      const b = LLM_GATE.queue[best]
+      const aDone = llmGateDoneCount(a.job, a.skill)
+      const bDone = llmGateDoneCount(b.job, b.skill)
+      if (aDone > bDone) { best = i; continue }
+      if (aDone === bDone && (STEP_ORDER.length - aDone) > (STEP_ORDER.length - bDone)) best = i
+    }
+    const w = LLM_GATE.queue.splice(best, 1)[0]
+    llmGateWaitEnd(w.job, w.skill) // granted -> freeze this wait into accumMs
+    LLM_GATE.active++
+    LLM_GATE.dispatches++
+    LLM_GATE.peak = Math.max(LLM_GATE.peak, LLM_GATE.active)
+    w.resolve()
+  }
+}
+async function llmGateAcquire(job, skill, step) {
+  if (LLM_GATE.active < LLM_GATE.cap) {
+    LLM_GATE.active++
+    LLM_GATE.dispatches++
+    LLM_GATE.peak = Math.max(LLM_GATE.peak, LLM_GATE.active)
+    markStepGate(job, skill, step, 'active') // slot granted: segment breathes
+    closeDispatch(job, skill) // first slot ends the scheduling stage
+    return
+  }
+  markStepGate(job, skill, step, 'queued') // waiting for scheduling (static)
+  llmGateWaitBegin(job, skill)
+  await new Promise((resolve) => { LLM_GATE.queue.push({ skill, job, step, resolve }) })
+  llmGateWaitEnd(job, skill) // slot granted -> freeze this wait into accumMs
+  markStepGate(job, skill, step, 'active') // slot granted: segment breathes
+  closeDispatch(job, skill)
+}
+function llmGateRelease() { LLM_GATE.active = Math.max(0, LLM_GATE.active - 1); llmGatePump() }
+// Run fn() holding exactly one global LLM dispatch slot. `step` (optional segment
+// name) is marked queued while waiting and active once a slot is granted.
+async function withLlmSlot(step, fn) {
+  const store = llmCtx.getStore() || {}
+  await llmGateAcquire(store.job || null, store.skill || null, step || null)
+  try { return await fn() }
+  finally { llmGateRelease() }
+}
+// ---- end global LLM dispatch semaphore ----
+
 async function gradeFor(body, cases, modelOverride) {
   const engine = CFG.gradeEngine === 'anchor' ? GRADE_ENGINE.ANCHOR : CFG.gradeEngine
   const signal = engine === GRADE_ENGINE.ANCHOR ? undefined : AbortSignal.timeout(CFG.judgeTimeoutMs)
@@ -94,7 +269,8 @@ async function gradeFor(body, cases, modelOverride) {
   // config default here made score/backtest fail fast to the anchor regex and read
   // 0.0s whenever the selected model differed from CFG.model (m07102).
   const judgeModel = modelOverride || CFG.model
-  return judgeBody(body, cases, { llm: SVC.llm, model: judgeModel, signal, engine })
+  // v2.1.0: judge calls go through the global LLM dispatch gate (m07696).
+  return withLlmSlot('score', () => judgeBody(body, cases, { llm: SVC.llm, model: judgeModel, signal, engine }))
 }
 
 // Validate & normalize a PRE-COMPUTED baseline (the frozen "before"). This is the
@@ -186,6 +362,14 @@ async function backtestImpl(args) {
   const skillName = String(args?.skillName || '')
   const draftContent = String(args?.draftContent ?? '')
   const cases = Array.isArray(args?.cases) ? args.cases : []
+  // v2.0.4: an after-score handed over from the landing step (writeImpl already
+  // graded the draft and persisted the run). When present we REUSE it instead of
+  // calling gradeFor a second time — saves a full LLM judge call and keeps the
+  // panel score identical to the ledger score (no more 88-vs-100 divergence).
+  const reuseAfter = (args?.reuseAfter !== null && args?.reuseAfter !== undefined && Number.isFinite(Number(args.reuseAfter)))
+    ? Number(args.reuseAfter) : null
+  const reuseAfterPassRate = Number.isFinite(Number(args?.reuseAfterPassRate)) ? Number(args.reuseAfterPassRate) : null
+  const reuseAfterEngine = args?.reuseAfterEngine || null
   if (!skillName) throw new Error('skillName is required')
   if (!cases.length) throw new Error('cases must be a non-empty array of {id,title,checks:[{id,text,must?,anchors?}]}')
   const skillFile = CFG.skillFile(skillName)
@@ -209,7 +393,9 @@ async function backtestImpl(args) {
     before = await gradeFor(currentNorm, cases, args?.model)
   }
   if (!before) before = await gradeFor(currentNorm, cases, args?.model)
-  const after = await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases, args?.model)
+  const after = (reuseAfter !== null)
+    ? { score: reuseAfter, passRate: reuseAfterPassRate, totalChecks: null, passedChecks: null, caseRows: [], engine: reuseAfterEngine || { kind: 'reused-landing' } }
+    : await gradeFor(draftContent.replace(/\r\n/g, '\n'), cases, args?.model)
   return {
     skillName,
     skillFileExists: current !== null,
@@ -612,7 +798,7 @@ function collectModelOptionsSync(currentModel) {
     const evals = readJson(CFG.evalsPath)
     for (const r of evals.runs || []) if (r.model) add(r.model.provider, r.model.model)
   } catch { /* evals unreadable → fall through to default + current */ }
-  add('workbuddy', 'hy4free')                       // the configured default
+  add('workbuddy', 'hy4flash-free')                       // the configured default
   if (currentModel) add(currentModel.provider, currentModel.model)
   return [...seen.values()].sort((a, b) => (a.provider + '/' + a.model).localeCompare(b.provider + '/' + b.model))
 }
@@ -653,7 +839,7 @@ async function collectModelOptions(currentModel) {
     new Promise((resolve) => setTimeout(resolve, 8000)),
   ])
   if (gotAny) {
-    add('workbuddy', 'hy4free')                     // keep the configured default selectable
+    add('workbuddy', 'hy4flash-free')                     // keep the configured default selectable
     if (currentModel) add(currentModel.provider, currentModel.model)
     return [...seen.values()].sort((a, b) => (a.provider + '/' + a.model).localeCompare(b.provider + '/' + b.model))
   }
@@ -726,11 +912,11 @@ async function panelStateImpl() {
     modelOptions: await collectModelOptions(pc.model),
     allowWrite: CFG.allowWrite,
     backupKeep: CFG.backupKeep,
-    maxConcurrency: CFG.maxConcurrency,
+    maxConcurrency: pc.maxConcurrency,
     phaseSummary,
     coordinator: {
-      evolutionMode: CFG.evolutionMode,
-      maxConcurrency: CFG.maxConcurrency,
+      evolutionMode: pc.evolutionMode || CFG.evolutionMode,
+      maxConcurrency: pc.maxConcurrency,
       active: running.filter((j) => ['queued', 'running', 'review', 'retrying'].includes(j.phase)).length,
       jobs: running.length,
     },
@@ -890,7 +1076,8 @@ Rules:
 - Start with a valid YAML frontmatter block: first line "---", then "name: <kebab-case>", "description: <one line>", then "---", then the body.
 - Keep every still-valid section of the CURRENT skill and integrate ALL listed suggestions into real, substantive improvements.
 - Write the genuinely best improved skill you can. You are NOT shown any grading rubric, scoring checklist, or anchor list, and you must NOT invent or try to satisfy one — the evaluation is separate and hidden from you.
-- Do NOT adopt, install, or overwrite any file. Return only the SKILL.md text.`
+- Do NOT adopt, install, or overwrite any file. Return only the SKILL.md text.
+- HARD SIZE CAP: the finished SKILL.md must stay under 65536 bytes (64KB). Chinese-dense text is about 2 bytes per token, so target under ~50KB to be safe. After writing, estimate the size and if it would exceed the cap, tighten it yourself: merge duplicate sections, drop redundant prose and stale overlapping Pitfalls, compress verbose examples to their load-bearing command/path/API lines, while preserving every executable detail and all still-valid content. Delivering an oversized draft gets it rejected and forces a rewrite, so stay under the cap on the first pass. Do NOT over-compress a draft that is already under the line: that only deletes usable detail.`
 
 // Independent DRAFT REVIEWER. The reviewer MAY see the rubric (it is the judge),
 // unlike the DRAFT AUTHOR above which must never see it. This keeps the draft
@@ -1067,8 +1254,8 @@ async function authorRubric(skill, suggestions, action, currentBody, model, repa
     '',
     'Return the rubric JSON object now.',
   ].join(NL)
-  const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
-  const rubricText = await streamAssistantText(SVC.llm, model, { system: RUBRIC_SYSTEM, user, signal })
+  const signal = jobCallSignal() // v2.2.7 honors job cancel
+  const rubricText = await withLlmSlot('rubric', () => streamAssistantText(SVC.llm, model, { system: RUBRIC_SYSTEM, user, signal }))
   const obj = extractJsonObject(rubricText)
   if (!obj || !Array.isArray(obj.cases)) {
     throw new Error('LLM (rubric call) did not return a parseable {"cases":[...]} object')
@@ -1081,7 +1268,7 @@ async function authorRubric(skill, suggestions, action, currentBody, model, repa
 // authored blind to the grading checklist so it cannot pander to it (user
 // m06631/m06634). The only cross-talk allowed is a repairHint carried over from
 // the independent REVIEWER (not the rubric itself).
-async function writeDraft(skill, suggestions, action, currentBody, model, repairHint) {
+async function writeDraft(skill, suggestions, action, currentBody, model, repairHint, slotStep) {
   const repair = repairHint ? `${NL}REPAIR: an independent reviewer rejected your previous draft because: ${repairHint}. Rewrite the full SKILL.md fixing exactly those points.` : ''
   const user = [
     `Skill: ${skill}`,
@@ -1095,8 +1282,11 @@ async function writeDraft(skill, suggestions, action, currentBody, model, repair
     '',
     'Return ONLY the full improved SKILL.md text now.',
   ].join(NL)
-  const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
-  const draftText = await streamAssistantText(SVC.llm, model, { system: DRAFT_SYSTEM, user, signal })
+  const signal = jobCallSignal() // v2.2.7 honors job cancel
+  // v2.2.15: an initial author call uses the 'draft' slot; a REWRITE in the
+  // review->rewrite loop passes slotStep='review' so its time lands on REVIEW, not
+  // on the already-finished DRAFT (m10548/m10594).
+  const draftText = await withLlmSlot(slotStep || 'draft', () => streamAssistantText(SVC.llm, model, { system: DRAFT_SYSTEM, user, signal }))
   const stripped = stripDraftFence(draftText)
   if (!stripped.trim()) throw new Error('LLM (draft call) returned empty SKILL.md text')
   // Never trust the model's frontmatter: re-synthesize a valid block in code.
@@ -1140,8 +1330,8 @@ async function reviewDraftInMemory(skill, draftContent, cases, suggestions, mode
     'Return the review JSON object now.',
   ].join(NL)
   try {
-    const signal = AbortSignal.timeout(CFG.draftTimeoutMs)
-    const reviewText = await streamAssistantText(SVC.llm, model, { system: DRAFT_REVIEW_SYSTEM, user, signal })
+    const signal = jobCallSignal() // v2.2.7 honors job cancel
+    const reviewText = await withLlmSlot('review', () => streamAssistantText(SVC.llm, model, { system: DRAFT_REVIEW_SYSTEM, user, signal }))
     const obj = extractJsonObject(reviewText)
     if (!obj || typeof obj.ok !== 'boolean') {
       return { ok: true, issues: [], degraded: 'reviewer returned unparseable JSON (treated as pass)' }
@@ -1149,6 +1339,12 @@ async function reviewDraftInMemory(skill, draftContent, cases, suggestions, mode
     const issues = Array.isArray(obj.issues) ? obj.issues.map((i) => String(i)).slice(0, 5) : []
     return { ok: obj.ok || issues.length === 0, issues }
   } catch (e) {
+    // v2.2.7 cooperative cancel: a cancel-abort must unwind, not be swallowed
+    // into a degraded "reviewer passed". Re-throw when the job was canceled so
+    // the worker stops; genuine reviewer errors still degrade to ok:true.
+    const st = llmCtx.getStore() || {}
+    const job = st.job
+    if (job && job.cancelRequested) throw e
     return { ok: true, issues: [], degraded: String((e && e.message) || e) }
   }
 }
@@ -1168,8 +1364,8 @@ async function reviewDraftInMemory(skill, draftContent, cases, suggestions, mode
 // internally runs write -> review -> rewrite (max 3) fully BEFORE landing, so a
 // reviewed, rubric-aware-judged draft is what gets landed. verify (incl. size + all
 // historical checks) is the final self-audit AFTER landing.
-const STEP_ORDER = ['dispatch', 'rubric', 'score', 'draft', 'landing', 'backtest', 'verify']
-function setStep(job, skill, step, status, detail) {
+const STEP_ORDER = ['dispatch', 'rubric', 'score', 'draft', 'review', 'landing', 'verify']
+function setStep(job, skill, step, status, detail, atOverride) {
   if (!job || !skill) return
   if (!job.progress) job.progress = {}
   const p = job.progress[skill] || (job.progress[skill] = { skill, status: 'queued', current: 'queued', steps: {}, error: null })
@@ -1184,7 +1380,31 @@ function setStep(job, skill, step, status, detail) {
   // again (m06022: "stuck on stage 1 then suddenly completes"). Give it its own
   // timestamp so its duration reads 0.0s (accurate for instant code steps).
   const nowIso = new Date().toISOString()
-  p.steps[step] = { status, at: nowIso, startAt: status === 'active' ? nowIso : (prev.startAt || nowIso), detail: String(detail || '') }
+  // v2.2.10: a segment stamped from its OWN fulfillment passes its real finish
+  // time so it isn't collapsed onto a later Promise.allSettled barrier instant.
+  const effAt = (typeof atOverride === 'string' && atOverride) ? atOverride : nowIso
+  // Structured retry trace (m07263 Q2): a step that goes active again after it
+  // already ran is a retry. Carry an attempts counter so the panel can surface
+  // "retried xN" instead of only the timestamp silently resetting. attempts is
+  // inherited from the previous step record and bumped on each re-activation.
+  const wasRun = prev.status === 'active' || prev.status === 'done' || prev.status === 'failed'
+  const attempts = (Number(prev.attempts) || 1) + (status === 'active' && wasRun ? 1 : 0)
+  const retried = attempts > 1
+  // v2.2.8 rewrite-time accounting: keep the FIRST start across rewrites and
+  // fold each completed run into accumMs so the segment shows the TOTAL time
+  // (first draft + rewrites), not just the latest rewrite (m09907).
+  const firstStartAt = prev.firstStartAt || (status === 'active' ? effAt : (prev.startAt || effAt))
+  // v2.2.12: SEPARATE the two clocks. accumMs = queue-wait ONLY (never written by
+  // setStep); runMs = folded prior runs. Mixing them in accumMs is what made the
+  // client read a gate wait as prior run time and inflate the segment clock
+  // (m10206/m10207: 36331s / 42724s on a 53s job).
+  const accumMs = Number(prev.accumMs) || 0
+  let runMs = Number(prev.runMs) || 0
+  if (status === 'active' && wasRun && prev.startAt) {
+    const ran = Date.now() - Date.parse(prev.startAt)
+    if (Number.isFinite(ran) && ran > 0) runMs += ran
+  }
+  p.steps[step] = { status, at: effAt, startAt: status === 'active' ? effAt : (prev.startAt || effAt), firstStartAt, accumMs, runMs, detail: String(detail || ''), attempts, retried }
 }
 
 // One logical worker per skill. It authors cases[] + draftContent via the host
@@ -1217,8 +1437,9 @@ async function relandForVerify({ skill, suggestionId, action, draftContent, case
 }
 
 async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
-  // worker picked this skill up -> close its dispatch (queue-wait) segment
-  setStep(job, skill, 'dispatch', 'done', 'worker picked up')
+  // dispatch stays ACTIVE for the skill's whole life (m07834 B): the gate stamps
+  // waitStartAt / accumMs on it directly, so it keeps live-ticking the cumulative
+  // LLM queue-wait. It is closed in finalize when the skill reaches a terminal state.
   const suggestions = openSuggestionsForSkill(skill)
   if (!suggestions.length) {
     setStep(job, skill, 'rubric', 'done', 'no open suggestions — skipped')
@@ -1235,15 +1456,25 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
   // improved body (user m06631/m06634).
   let rubricCases = null, rubricErr = null, rubricAttempts = 0
   let draftContent = null, draftErr = null, draftAuthorAttempts = 0
-  setStep(job, skill, 'rubric', 'active', 'LLM authors the hidden grading cases[]')
-  setStep(job, skill, 'draft', 'active', 'LLM writes the improved SKILL.md')
+  setStep(job, skill, 'rubric', 'queued', 'LLM authors the hidden grading cases[]')
+  setStep(job, skill, 'draft', 'queued', 'LLM writes the improved SKILL.md')
+  // v2.2.10: both halves run CONCURRENTLY but finish at different instants. Stamping
+  // them done after Promise.allSettled gave both the SAME terminal `at` => identical
+  // duration every run. Record each segment's REAL finish time at its own fulfillment.
+  const segFinish = Object.create(null)
   const rubricTask = (async () => {
     let last = null
     for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
       rubricAttempts = attempt
       try { return await authorRubric(skill, suggestions, action, currentBody, llmModel, last) }
-      catch (e) { last = String((e && e.message) || e) }
-      setStep(job, skill, 'rubric', 'active', `rubric rejected, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
+      catch (e) {
+        // v2.2.11: a dead network / refused connection is not worth retrying -- retrying
+        // only delayed surfacing the failure by up to ~15min (user m10079). Fail this
+        // segment NOW so the panel shows the failure within one poll.
+        if (e && e.isTransport) throw e
+        last = String((e && e.message) || e)
+      }
+      setStep(job, skill, 'rubric', 'queued', `rubric rejected, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
     }
     throw new Error(last || 'rubric generation failed')
   })()
@@ -1252,12 +1483,57 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
     for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
       draftAuthorAttempts = attempt
       try { return await writeDraft(skill, suggestions, action, currentBody, llmModel, last) }
-      catch (e) { last = String((e && e.message) || e) }
-      setStep(job, skill, 'draft', 'active', `draft authoring failed, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
+      catch (e) {
+        if (e && e.isTransport) throw e
+        last = String((e && e.message) || e)
+      }
+      setStep(job, skill, 'draft', 'queued', `draft authoring failed, retrying (attempt ${attempt}/${MAX_STEP_ATTEMPTS}): ${last}`)
     }
     throw new Error(last || 'draft authoring failed')
   })()
-  const settled = await Promise.allSettled([rubricTask, draftTask])
+  // close each segment the instant ITS OWN task lands (not at the barrier)
+  rubricTask.then((v) => { segFinish.rubric = new Date().toISOString(); setStep(job, skill, 'rubric', 'done', `cases ready (${(v || []).length})${rubricAttempts > 1 ? ` · retried ${rubricAttempts - 1}x` : ''}`, segFinish.rubric) }, () => {})
+  draftTask.then((v) => { segFinish.draft = new Date().toISOString(); setStep(job, skill, 'draft', 'done', `draft written (attempt ${draftAuthorAttempts}/${MAX_STEP_ATTEMPTS})${draftAuthorAttempts > 1 ? ` · retried ${draftAuthorAttempts - 1}x` : ''}`, segFinish.draft) }, () => {})
+  // v2.2.18: SCORE depends ONLY on the rubric cases + the live SKILL.md -- NEVER
+  // on the draft body. Launch it the instant rubricTask settles so it queues for
+  // an LLM slot WHILE the (much slower) draft is still authoring. Previously score
+  // sat behind the Promise.allSettled([rubric,draft]) barrier, so three skills all
+  // writing drafts left every slot idle with no score ever queued (m10928).
+  let frozen = null
+  const scoreTask = rubricTask.then(async (rc) => {
+    const cases = rc
+    const key = skill + '|' + casesHash(cases)
+    frozen = beforeCache.get(key)
+    const reuseHit = Boolean(frozen)
+    setStep(job, skill, 'score', 'queued', 'freezing before baseline (skill_evolution_score)')
+    if (!frozen) {
+      stats.scoreCalls++
+      let scErr = null
+      for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+        try { frozen = await scoreImpl({ skillName: skill, cases, model: llmModel }); scErr = null; break }
+        catch (e) { scErr = String((e && e.message) || e) }
+      }
+      if (!frozen) {
+        setStep(job, skill, 'score', 'failed', `scoring failed after ${MAX_STEP_ATTEMPTS} attempts: ${scErr}`)
+        throw new Error('scoring failed: ' + scErr)
+      }
+      beforeCache.set(key, frozen)
+    } else stats.beforeCacheHits++
+    setStep(job, skill, 'score', 'done', (reuseHit ? 'before cache hit / reused' : 'before frozen') + (frozen && frozen.baseline && frozen.baseline.engine ? ' [' + frozen.baseline.engine + ']' : ''))
+    // Expose the frozen baseline score NOW so the panel shows "before -> (pending)".
+    if (frozen && frozen.baseline && Number.isFinite(frozen.baseline.score)) {
+      const pNow = job.progress && job.progress[skill]
+      if (pNow) pNow.beforeScore = frozen.baseline.score
+    }
+    return frozen
+  })
+  // A rubric failure rejects scoreTask too; mark it handled now (we await below).
+  scoreTask.catch(() => {})
+
+  // Wait for all three. scoreTask ran CONCURRENTLY with draftTask, so this is
+  // max(draft, score), NOT draft + score -- the gate stays busy and score is not
+  // starved behind a slow draft (m10928).
+  const settled = await Promise.allSettled([rubricTask, draftTask, scoreTask])
   if (settled[0].status === 'fulfilled') rubricCases = settled[0].value
   else rubricErr = String((settled[0].reason && settled[0].reason.message) || settled[0].reason)
   if (settled[1].status === 'fulfilled') draftContent = settled[1].value
@@ -1266,71 +1542,71 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
     setStep(job, skill, 'rubric', 'failed', `rubric generation failed after ${rubricAttempts} attempts: ${rubricErr}`)
     return { skill, status: 'failed', reason: `rubric generation failed: ${rubricErr}`, attempts: rubricAttempts, suggestionIds: suggestions.map((s) => s.id) }
   }
-  setStep(job, skill, 'rubric', 'done', `cases ready (${(rubricCases || []).length})${rubricAttempts > 1 ? ` · retried ${rubricAttempts - 1}x` : ''}`)
+  // rubric 'done' now stamped at its own fulfillment (v2.2.10)
   if (draftErr) {
     // Rubric is still reusable, but without a body there is nothing to land. Report
     // failure honestly; beforeCache keeps the frozen baseline for a later retry.
     setStep(job, skill, 'draft', 'failed', `draft authoring failed after ${draftAuthorAttempts} attempts: ${draftErr}`)
     return { skill, status: 'failed', reason: `draft authoring failed: ${draftErr}`, attempts: draftAuthorAttempts, suggestionIds: suggestions.map((s) => s.id) }
   }
-
-  // ---- SCORE: freeze the before baseline from the rubric (BEFORE any landing) ----
-  const cases = rubricCases
-  const key = skill + '|' + casesHash(cases)
-  let frozen = beforeCache.get(key)
-  const reuseHit = Boolean(frozen)
-  setStep(job, skill, 'score', 'active', 'freezing before baseline (skill_evolution_score)')
-  if (!frozen) {
-    stats.scoreCalls++
-    let scoreErr = null
-    for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
-      try { frozen = await scoreImpl({ skillName: skill, cases, model: llmModel }); scoreErr = null; break }
-      catch (e) { scoreErr = String((e && e.message) || e) }
-    }
-    if (!frozen) {
-      setStep(job, skill, 'score', 'failed', `scoring failed after ${MAX_STEP_ATTEMPTS} attempts: ${scoreErr}`)
-      return { skill, status: 'failed', reason: `scoring failed: ${scoreErr}`, attempts: MAX_STEP_ATTEMPTS, suggestionIds: suggestions.map((s) => s.id) }
-    }
-    beforeCache.set(key, frozen)
-  } else stats.beforeCacheHits++
-  setStep(job, skill, 'score', 'done', (reuseHit ? 'before cache hit / reused' : 'before frozen') + (frozen && frozen.baseline && frozen.baseline.engine ? ' [' + frozen.baseline.engine + ']' : ''))
-  // Expose the frozen baseline score NOW so the panel shows "before -> (pending)".
-  if (frozen && frozen.baseline && Number.isFinite(frozen.baseline.score)) {
-    const pNow = job.progress && job.progress[skill]
-    if (pNow) pNow.beforeScore = frozen.baseline.score
+  if (settled[2].status === 'rejected') {
+    // scoreTask already stamped the score segment failed; surface it honestly.
+    const sr = settled[2].reason
+    return { skill, status: 'failed', reason: String((sr && sr.message) || sr), attempts: MAX_STEP_ATTEMPTS, suggestionIds: suggestions.map((s) => s.id) }
   }
+  // v2.1.0: the 'draft' segment is now just the author's initial write. Mark it done
+  // here; the separate 'review' segment owns the reviewer -> rewrite loop below.
+  // draft 'done' now stamped at its own fulfillment (v2.2.10)
+
+  // ---- SCORE baseline is ready (frozen while the draft was being written) ----
+  const cases = rubricCases
+  frozen = settled[2].value
 
   // ---- DRAFT: independent review -> rewrite loop, fully BEFORE landing ----
   // The reviewer (not the author) may see the rubric. Up to MAX_STEP_ATTEMPTS
   // total drafts; each rejected draft is rewritten with the reviewer's issues as
   // the repair hint (never the raw rubric). Exhausting the budget fails the skill.
+  // v2.2.15: create the REVIEW step BEFORE the first reviewer call -- markStepGate
+  // (used by the global LLM gate) ignores a step that does not exist yet, so the
+  // first review previously ran with no visible review segment and the panel
+  // looked stuck (m10548). The whole review->rewrite loop, including the author's
+  // rewrite call, is attributed to REVIEW -- never to the finished DRAFT (m10594).
+  setStep(job, skill, 'review', 'queued', 'reviewer checks the draft (review -> rewrite loop)')
   let review = await reviewDraftInMemory(skill, draftContent, cases, suggestions, llmModel)
   let draftTotalAttempts = draftAuthorAttempts
-  if (!review.ok) setStep(job, skill, 'draft', 'active', `reviewer rejected draft (1/${MAX_STEP_ATTEMPTS}): ${(review.issues || []).slice(0, 2).join('; ')}`)
+  if (!review.ok) setStep(job, skill, 'review', 'queued', `reviewer rejected draft (1/${MAX_STEP_ATTEMPTS}): ${(review.issues || []).slice(0, 2).join('; ')}`)
   while (!review.ok && draftTotalAttempts < MAX_STEP_ATTEMPTS) {
     draftTotalAttempts++
+    // v2.2.15: mark review active for the rewrite; writeDraft is called with
+    // slotStep='review' so the gate keeps the clock on review, not on draft.
+    setStep(job, skill, 'review', 'active', `rewriting draft (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS})`)
     try {
-      draftContent = await writeDraft(skill, suggestions, action, currentBody, llmModel, (review.issues || []).join(' | '))
+      draftContent = await writeDraft(skill, suggestions, action, currentBody, llmModel, (review.issues || []).join(' | '), 'review')
     } catch (e) {
-      setStep(job, skill, 'draft', 'failed', `rewrite failed (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}): ${String((e && e.message) || e)}`)
+      setStep(job, skill, 'review', 'failed', `rewrite failed (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}): ${String((e && e.message) || e)}`)
       return { skill, status: 'failed', reason: `draft rewrite failed: ${String((e && e.message) || e)}`, attempts: draftTotalAttempts, suggestionIds: suggestions.map((s) => s.id) }
     }
     review = await reviewDraftInMemory(skill, draftContent, cases, suggestions, llmModel)
     if (!review.ok && draftTotalAttempts < MAX_STEP_ATTEMPTS) {
-      setStep(job, skill, 'draft', 'active', `reviewer rejected rewrite ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}: ${(review.issues || []).slice(0, 2).join('; ')}`)
+      setStep(job, skill, 'review', 'queued', `reviewer rejected rewrite ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS}: ${(review.issues || []).slice(0, 2).join('; ')}`)
     }
   }
   if (!review.ok) {
-    setStep(job, skill, 'draft', 'failed', `draft failed review after ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS} attempts: ${(review.issues || []).slice(0, 2).join('; ')}`)
+    setStep(job, skill, 'review', 'failed', `draft failed review after ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS} attempts: ${(review.issues || []).slice(0, 2).join('; ')}`)
     return { skill, status: 'failed', reason: 'draft failed review', attempts: draftTotalAttempts, reviewIssues: review.issues, suggestionIds: suggestions.map((s) => s.id) }
   }
-  setStep(job, skill, 'draft', 'done', `draft passed review (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS})${draftTotalAttempts > 1 ? ` · retried ${draftTotalAttempts - 1}x` : ''}`)
+  setStep(job, skill, 'review', 'done', `draft passed review (attempt ${draftTotalAttempts}/${MAX_STEP_ATTEMPTS})${draftTotalAttempts > 1 ? ` · retried ${draftTotalAttempts - 1}x` : ''}`)
 
   // ---- LANDING: one draft per open suggestion, retried, under the write lock ----
   const draftIds = []
   const draftSugMap = {}
   let lastError = null
   let landingAttempts = 0
+  // v2.0.4: capture the landing (writeImpl) after-score so the backtest step can
+  // reuse it — the authoritative score already persisted to the ledger run.
+  let landedAfterScore = null
+  let landedAfterPassRate = null
+  let landedAfterEngine = null
   setStep(job, skill, 'landing', 'active', `writing ${suggestions.length} ready draft(s) (skill_evolution_write)`)
   for (const s of suggestions) {
     let landed = null
@@ -1346,7 +1622,15 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
         break
       } catch (e) { sErr = String((e && e.message) || e) }
     }
-    if (landed) { stats.writeCalls++; stats.beforeReused++; draftIds.push(landed.draftId); draftSugMap[landed.draftId] = s.id }
+    if (landed) {
+      stats.writeCalls++; stats.beforeReused++; draftIds.push(landed.draftId); draftSugMap[landed.draftId] = s.id
+      // v2.0.4: remember the authoritative after-score written to the ledger.
+      if (Number.isFinite(Number(landed.afterScore))) {
+        landedAfterScore = Number(landed.afterScore)
+        landedAfterPassRate = Number.isFinite(Number(landed.afterPassRate)) ? Number(landed.afterPassRate) : null
+        landedAfterEngine = landed.engine && landed.engine.after ? landed.engine.after : null
+      }
+    }
     else lastError = sErr
   }
   if (!draftIds.length) {
@@ -1358,9 +1642,13 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
   // ---- BACKTEST: score the after result once per skill (diagnostic) ----
   let bt = null
   let btError = null
-  setStep(job, skill, 'backtest', 'active', 'scoring the after result (skill_evolution_backtest)')
   try {
-    bt = await backtestImpl({ skillName: skill, draftContent, cases, before: frozen, model: llmModel })
+    bt = await backtestImpl({
+      skillName: skill, draftContent, cases, before: frozen, model: llmModel,
+      // v2.0.4: reuse the landing after-score (already graded + in the ledger);
+      // backtest only grades fresh when landing didn't yield one.
+      reuseAfter: landedAfterScore, reuseAfterPassRate: landedAfterPassRate, reuseAfterEngine: landedAfterEngine,
+    })
     stats.backtestCalls++; stats.beforeReused++
   } catch (e) {
     // backtest is diagnostic; record, do not fail the worker. Never swallow
@@ -1368,7 +1656,8 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
     btError = String((e && e.message) || e)
   }
   if (bt) {
-    setStep(job, skill, 'backtest', 'done', `after=${bt.after?.score} delta=${bt.delta}${bt.beforeFallback ? ' ⚠before recomputed (baseline drifted)' : ''}${bt.after?.engine ? ' [' + bt.after.engine + ']' : ''}`)
+    // v2.1.0: backtest is no longer a visible step (instant, reuses the landing
+    // after-score). Its delta still feeds the meta-row score comparison.
   } else {
     // v2.0.2 (m07140 Q3): a failed backtest must NOT read as a green 'done'
     // segment. Mark THIS segment failed (red X) so the panel is honest, but do NOT
@@ -1443,6 +1732,10 @@ async function runSkillWorker(skill, llmModel, stats, beforeCache, job) {
 // final independent per-draftId verify, and a CODE-generated report.
 async function runStateMachine(queue, model, maxConcurrency, job) {
   const llmModel = model || CFG.model
+  // Concurrency rework (m07696): this number now caps LLM dispatches, not workers.
+  llmGateSetCap(maxConcurrency)
+  LLM_GATE.peak = 0
+  LLM_GATE.dispatches = 0
   const stats = {
     workerCount: queue.length, agentCreates: 0, scoreCalls: 0, beforeCacheHits: 0,
     beforeReused: 0, writeCalls: 0, verifyCalls: 0, backtestCalls: 0,
@@ -1461,7 +1754,7 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
     // clock at job.startedAt (the evolve route's accept time), NOT now — the
     // route already spent real time building this queue before the state
     // machine began pumping, and that wait belongs to dispatch (m06336).
-    setStep(job, s, 'dispatch', 'active', 'queued — waiting for a worker slot')
+    setStep(job, s, 'dispatch', 'active', 'worker launched — LLM calls queue on the global gate')
     if (job.startedAt) job.progress[s].steps.dispatch.startAt = job.startedAt
   }
   await new Promise((resolve) => {
@@ -1477,14 +1770,18 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
       }
       if (cursor >= queue.length && stats.active === 0) { resolve(); return }
       if (job.cancelRequested) return // do not dispatch new; drain active then resolve
-      while (stats.active < maxConcurrency && cursor < queue.length) {
+      // v2.1.0 concurrency rework (m07696): skill 全开 — every queued skill worker
+      // launches immediately. maxConcurrency now caps concurrent LLM DISPATCHES via
+      // the global gate, not the number of running workers. stats.active still
+      // counts in-flight workers purely to know when the whole batch has drained.
+      while (cursor < queue.length) {
         const skill = queue[cursor++]
         stats.active++
         stats.peak = Math.max(stats.peak, stats.active)
-        runSkillWorker(skill, llmModel, stats, beforeCache, job)
+        llmCtx.run({ skill, job }, () => runSkillWorker(skill, llmModel, stats, beforeCache, job))
           .then((r) => { results.push(r) })
           .catch((e) => { results.push({ skill, status: 'failed', reason: String((e && e.message) || e) }) })
-          .finally(() => { stats.active--; pump() }) // PROCESS AS IT ARRIVES: refill the freed slot FIRST
+          .finally(() => { stats.active--; pump() }) // PROCESS AS IT ARRIVES: drain detection
       }
     }
     pump()
@@ -1513,6 +1810,13 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
   for (const r of results) {
     const p = job.progress && job.progress[r.skill]
     if (!p) continue
+    // close the cumulative dispatch (LLM queue-wait) segment (m07834 B)
+    if (p.steps && p.steps.dispatch && p.steps.dispatch.status !== 'done') {
+      const d = p.steps.dispatch
+      if (d.waitStartAt) { const st = Date.parse(d.waitStartAt); d.accumMs = (Number(d.accumMs) || 0) + (Number.isFinite(st) ? Math.max(0, Date.now() - st) : 0); d.waitStartAt = null }
+      d.status = 'done'
+      d.at = new Date().toISOString()
+    }
     if (r.status === 'ok') {
       for (const k of STEP_ORDER) {
         if (!p.steps[k]) p.steps[k] = { status: 'done', at: new Date().toISOString(), startAt: undefined, detail: '' }
@@ -1538,7 +1842,8 @@ async function runStateMachine(queue, model, maxConcurrency, job) {
     maxConcurrency,
     workerCount: stats.workerCount,
     agentCreates: stats.agentCreates, // ALWAYS 0: this driver spawns no agents
-    peakConcurrency: stats.peak,
+    peakConcurrency: LLM_GATE.peak, // peak concurrent LLM DISPATCHES (m07696)
+    llmDispatches: LLM_GATE.dispatches,
     scoreCalls: stats.scoreCalls,
     beforeCacheHits: stats.beforeCacheHits,
     beforeReused: stats.beforeReused,
@@ -1586,11 +1891,13 @@ function spawnStateMachine(queue, model, maxConcurrency, acceptedAt) {
     error: null,
     orchestrator: 'code-state-machine',
     progress: {},
+    abortController: new AbortController(), // v2.2.7 cooperative cancel
   }
   RUNNING.set(job.jobId, job)
   job.done = runStateMachine(queue, model, maxConcurrency, job).catch((e) => {
     job.status = 'failed'
     job.phase = 'failed'
+    job.finishedAt = new Date().toISOString() // v2.2.16: freeze the overview clock on failure too
     job.error = String((e && e.message) || e)
     for (const s of queue) {
       const p = job.progress && job.progress[s]
@@ -1661,6 +1968,7 @@ async function spawnMainAgent(skills, model, maxConcurrency, evolutionMode) {
     attempts: 1,
     reviewed: false,
     error: null,
+    abortController: new AbortController(), // v2.2.7 cooperative cancel
   }
   job.agent = agent
   RUNNING.set(job.jobId, job)
@@ -1738,6 +2046,12 @@ function registerPanelRoutes(ctx) {
     const register = (p, handler) => disposers.push(webCtx.webServer.register({ kind: 'exact', path: p, handler }))
 
     // GET → current panel state (per-skill suggestion counts, freshness, model, selection).
+    register('/api/skill-evolution/models', async (_request, response) => {
+      if (_request.method !== 'GET') { writeJson(response, 405, { error: 'method not allowed, use GET' }); return }
+      const pc = loadPanelConfig()
+      const modelOptions = await collectModelOptions(pc.model)
+      writeJson(response, 200, { ok: true, modelOptions })
+    })
     register('/api/skill-evolution/state', async (_request, response) => {
       try { writeJson(response, 200, await panelStateImpl()) }
       catch (e) { writeJson(response, 500, { error: String(e && e.message || e) }) }
@@ -1840,6 +2154,15 @@ function registerPanelRoutes(ctx) {
         } else {
           resolvedMode = pc.evolutionMode || CFG.evolutionMode
         }
+        // actionMode (v2.2.25): which bulk action the panel asked for.
+        //   'evolve' (default) — evolve every selected skill; per-skill write action
+        //                        stays hasLive ? 'update' : 'create'.
+        //   'create'           — 全选新建: only skills that have NO live SKILL.md
+        //                        can be created from scratch. Skills that already
+        //                        exist are skipped with a clear reason instead of
+        //                        hitting writeImpl's create-over-existing guard.
+        // Unknown values fall back to 'evolve' (never abort the whole request).
+        const actionMode = (body.actionMode === 'create') ? 'create' : 'evolve'
         // 'new' is code-driven: it needs ONLY the host llm service. 'legacy'
         // spawns a real main agent and therefore needs the agents service.
         // Check AFTER mode resolution so an unavailable service yields a clear
@@ -1858,6 +2181,12 @@ function registerPanelRoutes(ctx) {
         for (const skill of skills) {
           const suggestions = openSuggestionsForSkill(skill)
           if (!suggestions.length) { skipped.push({ skill, reason: 'no open (pending/expired) suggestion without a draftId' }); continue }
+          // 全选新建: a skill that already has a live SKILL.md cannot be created
+          // from scratch (writeImpl create-over-existing guard). Skip it loudly.
+          if (actionMode === 'create' && fs.existsSync(CFG.skillFile(skill))) {
+            skipped.push({ skill, reason: 'create skipped: SKILL.md already exists (use evolve to improve it)' })
+            continue
+          }
           queue.push(skill)
         }
         writeJson(response, 200, {
@@ -1865,6 +2194,7 @@ function registerPanelRoutes(ctx) {
           maxConcurrency: resolvedConcurrency,
           mode: resolvedConcurrency <= 1 ? 'serial' : 'concurrent',
           evolutionMode: resolvedMode,
+          actionMode,
           queued: queue,
           skipped,
           model,
@@ -1932,6 +2262,7 @@ function registerPanelRoutes(ctx) {
         if (job.cancelRequested) { writeJson(response, 200, { ok: true, jobId, cancelRequested: true, already: true }); return }
         if (job.status !== 'running') { writeJson(response, 409, { error: 'job is not running', status: job.status }); return }
         job.cancelRequested = true
+        try { if (job.abortController) job.abortController.abort(new Error('canceled by user')) } catch (_) {}
         writeJson(response, 200, { ok: true, jobId, cancelRequested: true })
       } catch (e) {
         writeJson(response, 500, { error: String((e && e.message) || e) })

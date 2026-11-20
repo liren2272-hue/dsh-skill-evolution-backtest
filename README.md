@@ -226,6 +226,12 @@ node selftest.mjs
 - 设置面板在 GUI 里**展示状态 + 配置 + 触发**：勾选技能、选模型，点「进化所选」触发 `new` 代码状态机（LLM 只产出 cases+草案）或 `legacy` 拉起 agent 会话跑进化（创造性改写仍归 LLM/agent）。面板本身不写账本、不采纳；两种模式都只把成果落成 `ready` 草案，绝不采纳/安装/覆盖正式 SKILL.md。
 - 「进化所选」`new` 模式依赖宿主 `llm` 服务、`legacy` 模式依赖 `agents`/`agentDefaultModel`/`sessions` 服务，缺失时该端点返回 503 而非误动作；任务跑在本进程内存里，宿主重启会丢进度记录（成稿已落账本的 `ready` 草案不受影响）。
 
+### v2.0.5 — 七段重构：起草 / 审查重写拆分 + 移除回测段
+
+- **起草与审查重写拆成两段**：原「撰写草案」段把「LLM 写改进稿」和「审查员→重写循环」并在一起，看不出时间花在哪。现拆成 `draft`（起草草案，作者写）+ `review`（审查重写，审查员可看 rubric、打回则重写，最多 3 次预算），各自独立计时。新七段：`dispatch → rubric → score → draft → review → landing → verify`。
+- **移除回测段**：v2.0.4 起回测只复用落地已评的 after 分做减法、瞬发完成，作为时间轴一段已无意义。`backtestImpl` 仍照常运行（其 delta 喂 meta 行评分对比），只是不再作为可见进度段。相应删除「↻ 重新回测」按钮（回测段已不存在，重测标记无意义）。
+- **段标签**：zh `造标准 / 冻结评分 / 起草草案 / 审查重写 / 落地评分 / 自审`；en `Rubric / Freeze / Draft / Review / Land+score / Verify`。
+
 ### v2.0.1 — 修「冻结评分 / 回测瞬发 0.0s」（评审用错模型）
 
 - **根因**：`gradeFor` 硬编码用 config 默认模型（`CFG.model`，默认 `workbuddy/hy4free`）去做语义评审，而不是 job 实际选中的模型。当面板选的模型与默认模型不同、或默认模型不可达时，评审 LLM 调用秒败失败 → `judgeCase` 静默回退到 anchor 正则（毫秒级）→ score / backtest 两段就读成 0.0s。rubric / draft / review 没这问题，因为它们直接拿到了 job 选中的 `llmModel`。
@@ -247,6 +253,180 @@ node selftest.mjs
 - **回测失败不再显绿勾（m07140 Q3）**：回测段失败时该段直接标红✕（不翻转整个技能为失败，因 landing+verify 已成功）；finalize 不再把已 failed 的段洗成绿 done。
 - **「重新回测」按钮（m07155 Q2）**：当唯一失败段是回测（草案已落地+自审过）时，显示「↻ 重新回测」按钮直达 `/rescore`（真重评 before+after），不再是没意义的整技能重跑；`/rescore` 也传 job 选中的模型保证同一可达评审。
 - **落地/自审耗时说明（m07140 Q4/Q5）**：落地里的 `writeImpl` 会对评分算一次真 LLM 语义评审（v2.0.1 修前用错模型秒败→秒回，修后真评审所以变长）；verify 纯读账本+\u54c8\u5e0c比对无 LLM，本就该瞬发。
+
+### v2.0.4 — 回测复用落地评分（消除 88-vs-100 分叉 + 停止重复 LLM 评审）
+
+**问题**：同一份草案被评分两次——落地（writeImpl）评一次并写入账本（权威分，记忆面板读的，如 0.875→88），回测（backtestImpl）又对**同一草案+同一套 cases** 独立重评一次（结果进 job 报告，我插件 panel 读的，如 1.00→100）。LLM judge 非确定性 → 两次漂移 → 两面板分叉，且白烧一次语义评审算力。
+
+**根因**：冻结公平门只挡了 before（当前技能只评一次），after（草案）从未冻结——落地评一次、回测又评一次。
+
+**修复**：
+- 落地步捕获 writeImpl 已评的 after 分（含 passRate/engine）。
+- 回测步把该分作为 `reuseAfter` 传入 `backtestImpl`；`backtestImpl` 见 `reuseAfter` 有值即复用、不再 `gradeFor`。
+- 一个权威分（账本分）贯穿 panel 与记忆面板，自动对齐到 88；每技能少调一次 LLM judge。
+
+`/rescore` 独立端点仍自行评分（无前置落地），行为不变。
+
+### v2.0.3 — 进化面板三处 UI 缺陷
+
+- **模型列表刷新**：加 `GET /api/skill-evolution/models` 端点，`refresh()` 显式重拉下拉（原列表只在 `/state` 里顺带、刷新按钮不更新）。
+- **步骤重试可视化**：`setStep` 加结构化 `attempts/retried` 字段，前端重试徽标「↻N」（原重试只重置时间、无重试痕迹）。
+- **meta 行评分挤爆**：删 `.seb2-scdelta{margin-left:auto}`、`.seb2-score` 改 size-to-content，评分不再把 delta 挤出被裁。
+
+### v2.1.0 — concurrency semantics rework: maxConcurrency = LLM dispatch concurrency
+
+Previously `maxConcurrency` (default 3) capped how many **skill workers** ran in parallel. That was the wrong lever — the plugin exists to save time, so what actually matters is how many **LLM calls** are dispatched at once. This release moves the cap:
+
+- **Skill 全开 (all-open):** every queued skill now launches its worker immediately. No more waiting for a worker slot.
+- **Global LLM semaphore:** a single gate (capacity = `maxConcurrency`) sits in front of the only two LLM choke points — `judgeBody` (all scoring) and `streamAssistantText` (rubric / draft / review drafting). At most N LLM calls are in flight at any instant.
+- **Three-tier scheduling when a slot frees:** ① slots never idle (always fill if anything waits); ② prefer the skill **closest to done** (finish-one-first — a finished skill stops competing for slots); ③ among equally-close skills, backfill the one with the **most remaining work** (longest-job-first — start heavy work early).
+- Priority context (`{skill, job}`) rides `AsyncLocalStorage`, so the gate wraps call sites without threading skill/job through every signature.
+- Panel copy updated (zh + en): the concurrency control, the overview chip and the parallel-snapshot subtitle now describe **LLM dispatch concurrency**, not worker parallelism.
+- Report field `peakConcurrency` now reports **peak concurrent LLM dispatches** (was peak workers); added `llmDispatches` (total gate grants for the run).
+
+### v2.1.2 - dispatch segment no longer climbs past job end (Q4)
+
+- Fixed the expanded-card dispatch (queue-wait) timer and status so they
+  settle the moment a skill chain finishes. The client segTime() dispatch
+  special-case never checked cur.status, so a stale waitStartAt kept the
+  shown seconds climbing and the label stuck on in-progress after the job
+  ended (user-reported m07974/m07976). It now freezes to accumMs whenever
+  dispatch.status is terminal, while an active chain still ticks live.
+
+### v2.2.25
+
+- 新增设置侧栏独立入口「技能进化」：仿照宿主全局面板机制，注册 `sidebar.panellist`（order 32）+ 同名 `main` 面板，点开即是完整的进化面板（带新设计的 icon，主题自适应 currentColor）。原插件设置卡片保留不变。
+- 新增「打开技能管理·进化」跳转按钮：派发 `mnemon:anchor`（`page:'skills'`）事件，直接切到宿主「技能管理」面板。
+- 操作栏在「全选」之后追加两个批量按钮：**全选进化**（选中全部并按现有逻辑改进）与 **全选新建**（选中全部、仅对尚无 SKILL.md 的技能强制新建；已有文件的技能自动跳过，避免 create 路由因文件已存在而报错）。两按钮都把 `actionMode` 传给 `/evolve`；后端 200 响应回显该字段。
+- 版本号 2.2.24 → 2.2.25；新增客户端离线回归 `tmp_verify_client.mjs`（17/17 通过，含渲染期 TDZ 回归断言 + 负向对照），后端 selftest 全通过。
+- **修空白面板**：真机点开「技能进化」侧栏入口时右侧全空。根因是 `allNames`/`evolveWithMode` 的 `useCallback` 依赖数组渲染时立即求值 `skills`，而 `skills` 原定义在组件后半段（`const` 暂时性死区 → `ReferenceError` → 组件整体崩溃）。把 `skills`/`modelOptions` 派生提前到状态声明之后消除 TDZ。旧的只注册不渲染的 harness 漏掉了它，现 harness 会真实执行组件函数体。
+
+### v2.2.24
+
+- Fixed segment times counting scheduling / queue-wait time as run time (user report 2026-11-17: "技能进化插件面板又把等待排队时间计入后面了……这个时间只是运行时间"; follow-up "你要改了所有类似问题，就是等待中时钟不开启"). The root cause: a pre-gate placeholder stamps `startAt` at worker launch (before the LLM slot is granted), so the old `segTime` ran its clock from `firstStartAt`/`startAt` and every segment inherited the whole gate wait — e.g. `造标准` showed 68s while only ~49s was real run time, and a `排队中` segment ran a live 68s wait clock.
+  - **Waiting segments carry no clock**: `queued` / `pending` now always render `—` (status only, no seconds). Queue wait is scheduling time and belongs exclusively to the `dispatch` segment, which keeps its clock. This also means a segment that is queued while another segment of the same skill is active no longer displays a running count — exactly "等待中时钟不开启".
+  - **Pure run time for active/done**: the clock now starts at the real `startAt` and subtracts the folded queue wait (`accumMs`), i.e. `run = (end − startAt) − accumMs`. Live-data check on the reported job: `造标准/rubric` 79s→61s, `起草草案/draft` 173s→100s, `冻结评分/score` 52s→28s — the removed seconds equal each segment's `accumMs` gate wait; `dispatch` stays 18s.
+  - Removed the now-unused `fmtTime` helper and the live `segWs` queue clock. Updated selftest section [19] and added section [23] covering the new timing contract; `node --check` + full selftest pass, and a formula simulation on the live jobs snapshot confirms every segment ≤ job wall-clock.
+
+### v2.2.23
+
+- Restored the design mockup's animations on the single-skill segmented bar (user report 2026-11-17: "正在进行的有动效，完成之后在条上打勾，错误打叉"). Three gaps versus `mockup_v2.html` were fixed, text/layout untouched:
+  - **Active flow**: the whole active segment was painted solid via inline `backgroundColor`, which covered the sliding `.seb2-flow` bright bar, so no motion was visible. The single-skill bar now leaves active as a light track (only `done`/`queued` get the inline solid color), letting `.seb2-flow` + `@keyframes seb2flow` show a glowing bar sliding left→right every 2.2s. The flow also dropped the `opacity:.85` dim and gained the mockup's `box-shadow` glow (color + `a6` ≈ 65% alpha). Verified by sampling computed `left` over time: −58px → −30px → 76px → 184px (`ANIMATION_CONFIRMED`). Overview `pmbar` / mini chains were intentionally left unchanged (they have no flow element).
+  - **Done ✓**: the white check had been dropped from the JSX (only the gradient `::after` highlight remained). It is re-added as a `.seb2-tick` sibling pushed **after** the `.seb2-seg` inside the stable `.seb2-segwrap`, with `z-index:1`, so the ✓ paints above the colored bar and stays centered on its own cell.
+  - **Fail ✕**: already rendered via `.seb2-seg.fail::after{content:"✕"}` — kept as-is.
+- Added selftest section [22] covering all three states plus the "overview paths unchanged" invariant; render-verified via a from-source harness (real CSS + real `SEG_COLORS`) at two animation timestamps.
+
+### v2.2.22
+
+- Fixed the single-skill segmented progress bar rendering no colors at all (user report 2026-11-17). The full-size per-skill track builds each segment as an empty `<span class="seb2-seg">` carrying its color via inline `backgroundColor`. As an inline element with no content, the span collapses to 0×0 and ignores `height:15px`, so every segment was invisible while the text labels (block + text) still rendered — exactly "文字排版正常，就缺彩条". Adding `display:block` to `.seb2-seg` makes the colored bar render; `.seb2-segwrap` is already blockified as a flex item, so this one CSS declaration is the whole fix. Text/layout untouched per request. (The mini chains were unaffected because `<i class="seb2-segmini">` is similarly a flex item.)
+- Aligned the segment palette with the redesign mockup (user follow-up 2026-11-17). `SEG_COLORS` was the plugin's legacy set `['#64748b','#5b61d6','#0891b2','#0d9e6a','#65a30d','#d97706','#ea580c']` — a gray first segment followed by the six colors shifted one slot, so the mockup's 7th rose `#c0267a` never appeared and the bar looked one step off from the design. It is now `['#5b61d6','#0891b2','#0d9e6a','#65a30d','#d97706','#ea580c','#c0267a']` (mockup `s1`..`s7`). The single shared array means the per-skill track, overview `pmbar` and mini chains all align together.
+
+### v2.2.21
+
+- Restored the seven-color bar on the parallel/overview chains (m11408). The overview `pmbar`
+  segments were styled with `style: { '--c': SEG_COLORS[i] }`, a CSS custom property React's
+  sanitizer strips from inline styles, so `.seb2-segmini.done/.active { background: var(--c) }`
+  had no color to read and every bar rendered gray. They now use inline `backgroundColor` just
+  like the per-skill mini chain, so each done/active/queued segment keeps its own color.
+- Merged step status and elapsed time onto one line (m11408). A step label used to stack the
+  name, a status word and a separate time node (`\u5df2\u5b8c\u6210` / `102s`); status and time now
+  render together as `\u5df2\u5b8c\u6210\uff0c102\u79d2` with a locale-aware separator and unit in both
+  zh and en, removing the third line.
+
+### v2.2.20
+
+- Fixed the frozen-score segment ticking while it was only queued for an LLM slot (m11226). `score` was marked `active` in code right after the rubric settled, before `gradeFor` acquired a gate slot, so its clock ran during the whole queue wait. An audit of every `setStep(...,'active')` and `withLlmSlot` call site confirmed score was the only segment that went active in code rather than through the gate; it now starts as a `queued` placeholder and the gate flips it to `active` only when a slot is actually granted, matching rubric/draft/review.
+- Fixed max concurrency having no memory across restarts (m11226). `configure()` rebuilt `CFG` from defaults at every process start and `/state` reported `CFG.maxConcurrency`, so the value saved in `panel-config.json` was ignored until re-entered. `configure()` now restores persisted model/concurrency/evolutionMode from disk and `/state` reports the on-disk `pc` values. Also fixed a latent `ReferenceError` in `GET /api/skill-evolution/models`, which called the undefined `readPanelConfig()` instead of `loadPanelConfig()`.
+
+### v2.2.19
+
+- Fixed the panel freezing on step one until the user exited and re-entered (m11128). The job-poll effect decided whether to keep polling from `jobsRef.current`, which was the previous render's snapshot; a stale 'idle' read at run start killed the chain for good. It now decides cadence from the freshly fetched snapshot and keeps a slow idle poll, so progress always tracks the backend.
+- Fixed a segment showing 76s while running then freezing at 56s (m11092). The active branch used `runMs + (now - startAt)` while the done branch used the `firstStartAt -> at` wall-clock span; after a rewrite the two disagreed. Active now uses the same `firstStartAt -> now` span, so the timer runs continuously through completion.
+
+### v2.2.18
+
+- Fixed the global LLM gate running below its configured concurrency while independent scoring work waited (m10928). `score` (which only needs the frozen rubric cases + the live SKILL.md, never the draft body) used to sit behind the `Promise.allSettled([rubricTask, draftTask])` barrier, so when several skills were all still authoring drafts no score ever queued for a slot even though one was free. Score is now launched off `rubricTask` alone as a concurrent `scoreTask` and enters the gate the moment the rubric lands; the worker awaits `Promise.allSettled([rubricTask, draftTask, scoreTask])`, so wall-clock is `max(draft, score)` instead of their sum. Failure semantics (rubric/draft/score) are unchanged.
+
+### v2.2.17
+
+- Fixed the per-skill card "total time" still climbing after that skill's backtest finished (m10771). `setStep` never sets `progress[skill].status` to `done` after the last step, so `skillDuration` saw a `running` skill and kept using `Date.now()` even when every step was terminal. It now freezes once the current step is terminal, all seven steps are terminal, `p.status` is terminal, or the job has `finishedAt`, and floors the value at the job end when present.
+- Fixed per-segment times larger than the card's total time (m10750/m10751). The done-segment clock added `runMs` to `at - startAt`, but `runMs` already folds earlier attempts and `startAt` is the latest grant, so rewritten skills double counted (rubric 196s vs 103s on live data). Done segments now use the real `firstStartAt -> at` wall-clock span.
+
+### v2.2.16
+
+- Fixed the overview-strip "total time" still climbing after the skill finished. There are two separate elapsed timers: the per-skill card timer (`skillDuration`, frozen in v2.2.14) and the overview-strip total, which still computed `now - latestStart` with no `finishedAt` floor, so the once-per-second tick pushed it up forever after completion. The overview now freezes at the newest job's `finishedAt`, and failed jobs now also record `finishedAt` so they freeze too.
+
+### v2.2.15
+
+- Fixed the active-segment clock showing absurd values like "23027s" (m10536): `segTime()` added `runMs` (milliseconds) directly to the elapsed seconds. It now converts `runMs` to seconds before summing.
+- The review/rewrite phase now owns its time and progress (m10548/m10594). The REVIEW step is created before the first reviewer call so the global LLM gate can mark it active (it previously ran with no visible segment and the panel looked stuck), and the author's rewrite call routes through the review gate slot so rewrite time accumulates on REVIEW instead of the already-finished DRAFT.
+- While the dispatch/scheduling segment is active, per-call queued segments no longer run their own clocks (m10526); dispatch owns the single scheduling clock and other segments show an em-dash until they actually get a slot.
+
+### v2.2.14
+
+- Finished skills no longer keep counting while the job is still running another skill or verifying. `skillDuration` now freezes a skill whose `progress[skill].status` is terminal (done/failed/skipped/canceled) to the job end (`finishedAt`) instead of `Date.now()`, so a skill that finished early does not drift upward with the rest of the job (m10381).
+- The draft rewrite now keeps a live clock on the draft segment. A rewrite runs inside the review LLM slot, so the draft segment previously froze during the rewrite and jumped at the end; it is now re-marked active at rewrite start and done at rewrite finish with the real time (m10364).
+
+### v2.2.13
+- Rewrite queue-wait now live-ticks a scheduling clock. The per-step wait stamp that v2.2.6 documented but never implemented is now real: when a call actually queues on the global LLM gate (llmGateAcquire slow path), the step gets a waitStartAt, so the panel runs a live queued-Ns dispatch clock during a rewrite wait instead of freezing (m10273: stuck, then a sudden 120s jump). On grant the wait folds into the queue-wait bucket, not run time, so the segment total no longer jumps.
+
+### v2.2.12 — 段落计时溢出修复（造标准/起草草案显示 3.6万/4.2万秒）
+
+排队等待与已运行时长此前折进同一个 `accumMs`，面板把排队时长当「之前运行」反复叠加，53 秒的任务显示成 ~10 小时。现拆成两个字段：`accumMs` 只存排队等待、新增 `runMs` 只存已运行，前端各读各的，段落时钟不再溢出。
+
+### v2.2.10
+
+- **Rubric and draft durations no longer always identical** (true root fix): the two halves run concurrently but finish at different instants. Previously the worker stamped both done only after a `Promise.allSettled` barrier, so both got the SAME terminal timestamp — identical duration every run. Each segment is now closed at its OWN fulfillment with its real finish time.
+
+### v2.2.9
+
+
+- **Finished-state goes live**: the poller issues one guaranteed final `pollJobs()` the moment a job settles, so the completed count and done/failed status no longer land one frame late (previously looked frozen until re-entry).
+- **Status glyphs removed**: dropped the per-segment check tick and the hint-row fail/run/score/warn icon — color + text already carry the state.
+
+### v2.2.8
+
+- **Draft rewrite time accumulates**: a rewrite no longer resets the segment clock to ~0s. The first run's time is folded into `accumMs` (backend `firstStartAt`), and the segment clock shows the TOTAL across the initial draft + every rewrite instead of just the latest one.
+
+### v2.2.7
+
+- **Cancel interrupts the in-flight LLM call**: `/cancel` now aborts the running stream (job-level `AbortController` + `AbortSignal.any`) instead of only setting a flag and waiting for the current 5-minute call to finish. The review catch re-throws on cancel so it isn't swallowed as a degraded pass.
+
+### v2.2.6
+
+- **Placeholder-queued clock fixed**: a segment only shows the queue-wait clock once it's actually waiting on the gate. Pre-gate placeholders no longer stamp `waitStartAt` (which made waiting segments look like they were running and made rubric/draft show identical clocks).
+
+### v2.2.5
+
+- **Verifying phase judged alive everywhere**: the two missed alive-lists (`isRunning`, running-jobs count) now include `verifying`, so the panel no longer freezes during final verification.
+
+### v2.2.4
+
+
+- **修纯占位 queued 段乱跑排队钟（m09659）**：worker 起步就给量规/草案 setStep queued（还没轮到进闸），这些占位段无 waitStartAt 却因 setStep 盖了 at 而显出跑动的秒数。改为只有真正在闸上排队（有 waitStartAt）的段才跑排队钟，纯占位 queued 显「—」。
+
+### v2.2.3
+
+- **修段时重复计时（m09619）**：v2.2.1 的 active 段把排队 `accumMs` 折进 `startAt→now`，但 `startAt` 是抢到槽位时盖的、`now-startAt` 已是纯执行时间不含排队 → 排队被算两次，段时能超过 job 总墙钟（截图：起草草案 105s > 总用时 91s）。改为 active/done 段只显示纯执行时间，排队只在 queued 态实时钟体现。
+
+### v2.2.2 — panel no longer freezes during final verification
+
+- **Fix: progress panel froze at the end of a run.** The backend sets `job.phase = 'verifying'` while it runs the final independent re-read (`verifyImpl`), which can take a while. Every client "is anything running" check listed `['queued','running','review','retrying']` and omitted `'verifying'`, so once a job entered verification the 3s `/jobs` poll stopped rescheduling and the 1s now-clock stopped — the panel froze on its last frame until you left and re-entered the page. Added `'verifying'` to all four running checks so the panel keeps polling and ticking until the job is genuinely done.
+
+### v2.2.1 — queued-wait clock per segment + draft size guard
+
+- **Per-segment queue-wait clock.** Every LLM-bound segment (rubric / score / draft / review / landing) now records how long it waited on the global concurrency gate (`markStepGate` stamps `waitStartAt` on queued, folds it into `accumMs` on grant). The panel shows a live "queued Ns" on queued segments and folds the recorded wait into the elapsed total once a slot is granted — previously non-dispatch segments showed a frozen `0.0s` while queued.
+- **Draft author told the size cap.** `DRAFT_SYSTEM` now states the 65536-byte (64KB) hard cap and the ~50KB safety line up front, so the first draft targets under the cap and oversized-rejection rewrite rounds stop burning an extra LLM call.
+
+### v2.2.0 — queued state-machine: a segment breathes only while holding a slot
+
+- New **queued** segment state. `queued == waiting for scheduling == stage one` (user m08099). A per-call segment (rubric / draft / review / score) is marked `queued` (static, muted, no breathing) while its LLM call waits on the global gate, and only flips to `active` (breathing) once a slot is actually granted. The worker no longer pre-marks rubric/draft/review `active` before the gate.
+
+- The **dispatch (scheduling) segment now closes** the moment a skill acquires its FIRST LLM slot, so past the scheduling stage it goes silent instead of breathing for the whole chain. Later queue-waits still fold their ms into `dispatch.accumMs` (frozen timer), so the cumulative LLM wait is preserved without the visual noise. Fixes the 3-skills/4-slots case where the two running skills kept their first light breathing and the third skill lit scheduling+rubric+draft together - now the waiting skill shows only scheduling, and running skills show only their active per-call segments.
+
+- **Removed the segment retry badge** (the `\u21bb N` chip): the review/rewrite step already surfaces retries in its detail text, so the badge was redundant noise (user m08067/m08068).
+
+- Panel dictionaries gained `progress.stepStatus.queued` (zh 排队中 / en queued), plus muted CSS for the queued segment, mini-chain cell and label text.
 
 ### v1.19.4 — 动态时钟 + 默认不勾选 + 活动色块
 
