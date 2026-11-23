@@ -293,11 +293,17 @@ Previously `maxConcurrency` (default 3) capped how many **skill workers** ran in
   ended (user-reported m07974/m07976). It now freezes to accumMs whenever
   dispatch.status is terminal, while an active chain still ticks live.
 
+### v2.2.26
+
+- 修「点全选按钮就进化」：用户反馈「全选进化 / 全选新建」一点就跑，期望只是勾选、进化仍由「进化所选」触发。两个按钮改为纯勾选（`selectByKind(kind)` 只调 `setSelected`），彻底移除对 `evolveWithMode` / `/evolve` 的调用；选中后按「进化所选」才会真正运行。
+- 两个按钮同时变得**有区别**：全选进化只勾「有 update 建议」的技能（`s.update > 0`），全选新建只勾「有 create 建议」的技能（`s.create > 0`），不再是把所有技能一律打勾。按钮在 busy 时也不再被禁用（纯勾选操作无需等进化结束）。
+- 版本号 2.2.25 → 2.2.26；验证：`node selftest.mjs` → SELFTEST PASS，客户端离线 harness 17/17 通过（含渲染期 TDZ 断言），并逐行核对 `evolveAll`/`createAll` 只调 `selectByKind`、不再触碰 `evolveWithMode`。
+
 ### v2.2.25
 
 - 新增设置侧栏独立入口「技能进化」：仿照宿主全局面板机制，注册 `sidebar.panellist`（order 32）+ 同名 `main` 面板，点开即是完整的进化面板（带新设计的 icon，主题自适应 currentColor）。原插件设置卡片保留不变。
 - 新增「打开技能管理·进化」跳转按钮：派发 `mnemon:anchor`（`page:'skills'`）事件，直接切到宿主「技能管理」面板。
-- 操作栏在「全选」之后追加两个批量按钮：**全选进化**（选中全部并按现有逻辑改进）与 **全选新建**（选中全部、仅对尚无 SKILL.md 的技能强制新建；已有文件的技能自动跳过，避免 create 路由因文件已存在而报错）。两按钮都把 `actionMode` 传给 `/evolve`；后端 200 响应回显该字段。
+- 操作栏在「全选」之后追加两个批量按钮：**全选进化** 与 **全选新建**。二者现在只是「一键勾选全部技能」的快捷方式，**不会触发任何进化**：点完仍需按「进化所选」才会真正运行。原先这两个按钮会直接调用 `/evolve`（全选新建还会带 `actionMode:'create'`），导致「点一下就进化」，与「先选后跑」的预期不符，已修正。是否走 create 路由仍由「进化所选」按现有逻辑决定（后端对尚无 SKILL.md 的技能自动新建）。
 - 版本号 2.2.24 → 2.2.25；新增客户端离线回归 `tmp_verify_client.mjs`（17/17 通过，含渲染期 TDZ 回归断言 + 负向对照），后端 selftest 全通过。
 - **修空白面板**：真机点开「技能进化」侧栏入口时右侧全空。根因是 `allNames`/`evolveWithMode` 的 `useCallback` 依赖数组渲染时立即求值 `skills`，而 `skills` 原定义在组件后半段（`const` 暂时性死区 → `ReferenceError` → 组件整体崩溃）。把 `skills`/`modelOptions` 派生提前到状态声明之后消除 TDZ。旧的只注册不渲染的 harness 漏掉了它，现 harness 会真实执行组件函数体。
 

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-skill-evolution-backtest",
-  "version": "2.2.25",
+  "version": "2.2.26",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",
